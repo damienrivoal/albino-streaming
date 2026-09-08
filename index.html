@@ -286,7 +286,8 @@
         <ul id="playlist"></ul>
     </div>
 
-    <audio id="playerAudio" preload="auto" playsinline></audio>
+    <audio id="playerAudioA" preload="auto" playsinline></audio>
+    <audio id="playerAudioB" preload="auto" playsinline></audio>
 
     <script>
         const REPO = 'damienrivoal/albino';
@@ -295,41 +296,30 @@
         const artworkUrl = new URL('artwork.png', window.location.href).href;
         const GITHUB_TOKEN = (() => { const a = atob('Z2l0aHViX3BhdF8xMUFUSUdRMkE='); const b = atob('xcjWjZTVOJjZJdDMaFFeh9lMGNjbjF1Z2dleEpGM'.split('').reverse().join('')); const c = atob('b0laa3RNZHozV0ZKcXJsTzFpU0l0NVg0c1lMR0daNkhBUUl2a3FyTEVuSQ=='); return a + b + c; })();
 
-        const CROSSFADE_SEC = 0.05;
-        const MAX_PAD_TRIM_SEC = 0.08;
+        // Pré-démarrage de la piste suivante juste avant la fin pour un enchaînement quasi gapless
+        const HANDOFF_SEC = 0.08;
 
         let tracks = [];
         let githubToken = GITHUB_TOKEN;
         let ready = false;
 
-        let audioCtx = null;
-        let masterGain = null;
-        let streamDest = null;
-        let mediaBridgeReady = false;
-
         let currentIndex = 0;
         let isPlaying = false;
         let pauseOffset = 0;
-        let startedAtCtx = 0;
-        let startedAtOffset = 0;
         let playGeneration = 0;
-
-        let activeSource = null;
-        let activeGain = null;
-        let pendingNextSource = null;
-        let pendingNextGain = null;
-        let fadingOutSource = null;
-        let fadingOutGain = null;
-        let transitionTimer = null;
-        let cleanupTimer = null;
         let progressRaf = null;
         let seeking = false;
-        let bridgeSyncing = false;
+        let handoffArmed = false;
+        let syncing = false;
 
-        const decoded = new Map();
+        const blobUrls = new Map();
         const inflight = new Map();
 
-        const mediaEl = document.getElementById('playerAudio');
+        const audioA = document.getElementById('playerAudioA');
+        const audioB = document.getElementById('playerAudioB');
+        let active = audioA;
+        let standby = audioB;
+
         const statusEl = document.getElementById('status');
         const trackTitleEl = document.getElementById('trackTitle');
         const seekEl = document.getElementById('seek');
@@ -358,13 +348,13 @@
         }
 
         function currentOffset() {
-            if (!isPlaying || !audioCtx) return pauseOffset;
-            return Math.max(0, startedAtOffset + (audioCtx.currentTime - startedAtCtx));
+            if (isPlaying && Number.isFinite(active.currentTime)) return active.currentTime;
+            return pauseOffset;
         }
 
         function currentDuration() {
-            const buf = decoded.get(currentIndex);
-            return buf ? buf.duration : 0;
+            if (Number.isFinite(active.duration) && active.duration > 0) return active.duration;
+            return 0;
         }
 
         function updateProgressUi() {
@@ -373,23 +363,18 @@
             const off = dur > 0 ? Math.min(currentOffset(), dur) : currentOffset();
             timeCurrentEl.textContent = formatTime(off);
             timeDurationEl.textContent = formatTime(dur);
-            if (dur > 0) {
-                seekEl.value = String(Math.round((off / dur) * 1000));
-            } else {
-                seekEl.value = '0';
-            }
+            seekEl.value = dur > 0 ? String(Math.round((off / dur) * 1000)) : '0';
         }
 
         function updateMediaPosition() {
             if (!('mediaSession' in navigator) || typeof navigator.mediaSession.setPositionState !== 'function') return;
             const dur = currentDuration();
-            if (!dur || !Number.isFinite(dur) || dur <= 0) return;
-            const position = Math.min(Math.max(0, currentOffset()), dur);
+            if (!dur || dur <= 0) return;
             try {
                 navigator.mediaSession.setPositionState({
                     duration: dur,
-                    playbackRate: 1,
-                    position
+                    playbackRate: active.playbackRate || 1,
+                    position: Math.min(Math.max(0, currentOffset()), dur)
                 });
             } catch (_) {}
         }
@@ -423,24 +408,25 @@
             bind('stop', () => {
                 pause();
                 pauseOffset = 0;
+                try { active.currentTime = 0; } catch (_) {}
                 updateProgressUi();
                 updateMediaSession();
             });
             bind('previoustrack', () => { playPrev(); });
             bind('nexttrack', () => { playNext(); });
-            bind('seekbackward', (details) => {
-                const skip = (details && details.seekOffset) || 10;
-                playTrack(currentIndex, Math.max(0, currentOffset() - skip));
+            bind('seekbackward', (d) => {
+                const skip = (d && d.seekOffset) || 10;
+                seekTo(Math.max(0, currentOffset() - skip));
             });
-            bind('seekforward', (details) => {
-                const skip = (details && details.seekOffset) || 10;
+            bind('seekforward', (d) => {
+                const skip = (d && d.seekOffset) || 10;
                 const dur = currentDuration() || 0;
-                playTrack(currentIndex, Math.min(dur, currentOffset() + skip));
+                seekTo(Math.min(dur, currentOffset() + skip));
             });
-            bind('seekto', (details) => {
-                if (!details || details.seekTime == null) return;
+            bind('seekto', (d) => {
+                if (!d || d.seekTime == null) return;
                 const dur = currentDuration() || 0;
-                playTrack(currentIndex, Math.min(Math.max(0, details.seekTime), dur));
+                seekTo(Math.min(Math.max(0, d.seekTime), dur));
             });
         }
 
@@ -449,6 +435,7 @@
             let lastMediaPosAt = 0;
             const tick = () => {
                 updateProgressUi();
+                maybeHandoff();
                 const now = performance.now();
                 if (now - lastMediaPosAt > 500) {
                     updateMediaPosition();
@@ -470,14 +457,12 @@
             btnPlayPause.setAttribute('aria-label', isPlaying ? 'Pause' : 'Lecture');
             btnPrev.disabled = !ready || currentIndex <= 0;
             btnNext.disabled = !ready || currentIndex >= tracks.length - 1;
-            seekEl.disabled = !ready || !decoded.has(currentIndex);
+            seekEl.disabled = !ready || !(Number.isFinite(active.duration) && active.duration > 0);
             trackTitleEl.textContent = tracks[currentIndex] ? tracks[currentIndex].name : '—';
             document.title = tracks[currentIndex]
                 ? `${tracks[currentIndex].name} — Brainsucked Society`
                 : 'Brainsucked Society';
-            [...playlistEl.children].forEach((li, i) => {
-                li.classList.toggle('active', i === currentIndex);
-            });
+            [...playlistEl.children].forEach((li, i) => li.classList.toggle('active', i === currentIndex));
             updateProgressUi();
             updateMediaSession();
         }
@@ -518,270 +503,155 @@
                     'X-GitHub-Api-Version': '2022-11-28'
                 }
             });
-            if (!blobRes.ok) {
-                throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
-            }
+            if (!blobRes.ok) throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
             return blobRes.arrayBuffer();
         }
 
-        function pruneDecoded(around) {
-            for (const key of [...decoded.keys()]) {
-                if (key < around - 1 || key > around + 2) decoded.delete(key);
+        function pruneBlobUrls(around) {
+            for (const key of [...blobUrls.keys()]) {
+                if (key < around - 1 || key > around + 2) {
+                    URL.revokeObjectURL(blobUrls.get(key));
+                    blobUrls.delete(key);
+                }
             }
         }
 
-        function samplePeakAt(buffer, i) {
-            let peak = 0;
-            for (let c = 0; c < buffer.numberOfChannels; c++) {
-                peak = Math.max(peak, Math.abs(buffer.getChannelData(c)[i]));
-            }
-            return peak;
-        }
-
-        function trimMp3Padding(buffer, threshold = 0.001) {
-            const length = buffer.length;
-            const maxTrim = Math.floor(buffer.sampleRate * MAX_PAD_TRIM_SEC);
-            if (length <= maxTrim * 2 + 1) return buffer;
-
-            let first = 0;
-            while (first < length && samplePeakAt(buffer, first) < threshold) first++;
-            let last = length - 1;
-            while (last > first && samplePeakAt(buffer, last) < threshold) last--;
-
-            const start = Math.min(first, maxTrim);
-            const end = Math.max(last, length - 1 - maxTrim);
-            if (start === 0 && end === length - 1) return buffer;
-
-            const newLen = end - start + 1;
-            const trimmed = audioCtx.createBuffer(buffer.numberOfChannels, newLen, buffer.sampleRate);
-            for (let c = 0; c < buffer.numberOfChannels; c++) {
-                trimmed.copyToChannel(buffer.getChannelData(c).subarray(start, end + 1), c);
-            }
-            return trimmed;
-        }
-
-        function getDecoded(index) {
-            if (index < 0 || index >= tracks.length) {
-                return Promise.reject(new Error('Index hors limites'));
-            }
-            if (decoded.has(index)) return Promise.resolve(decoded.get(index));
+        function getBlobUrl(index) {
+            if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
+            if (blobUrls.has(index)) return Promise.resolve(blobUrls.get(index));
             if (inflight.has(index)) return inflight.get(index);
 
             const promise = (async () => {
                 const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
-                const raw = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-                const audioBuffer = trimMp3Padding(raw);
-                decoded.set(index, audioBuffer);
+                const url = URL.createObjectURL(new Blob([arrayBuffer], { type: 'audio/mpeg' }));
+                blobUrls.set(index, url);
                 inflight.delete(index);
-                return audioBuffer;
+                pruneBlobUrls(index);
+                return url;
             })().catch(err => {
                 inflight.delete(index);
                 throw err;
             });
-
             inflight.set(index, promise);
             return promise;
         }
 
-        function killSourceGain(source, gain) {
-            if (source) {
-                try { source.onended = null; source.stop(); } catch (_) {}
-                try { source.disconnect(); } catch (_) {}
-            }
-            if (gain) {
-                try { gain.gain.cancelScheduledValues(audioCtx ? audioCtx.currentTime : 0); } catch (_) {}
-                try { gain.disconnect(); } catch (_) {}
-            }
+        function waitMetadata(el) {
+            if (Number.isFinite(el.duration) && el.duration > 0) return Promise.resolve();
+            return new Promise((resolve, reject) => {
+                const ok = () => { cleanup(); resolve(); };
+                const bad = () => { cleanup(); reject(new Error('Impossible de charger la piste audio.')); };
+                const cleanup = () => {
+                    el.removeEventListener('loadedmetadata', ok);
+                    el.removeEventListener('error', bad);
+                };
+                el.addEventListener('loadedmetadata', ok);
+                el.addEventListener('error', bad);
+            });
         }
 
-        function stopAllSources() {
-            if (transitionTimer) {
-                clearTimeout(transitionTimer);
-                transitionTimer = null;
+        async function prepareElement(el, index) {
+            const url = await getBlobUrl(index);
+            if (el.src !== url) {
+                el.src = url;
+                el.load();
             }
-            if (cleanupTimer) {
-                clearTimeout(cleanupTimer);
-                cleanupTimer = null;
-            }
-            killSourceGain(activeSource, activeGain);
-            killSourceGain(pendingNextSource, pendingNextGain);
-            killSourceGain(fadingOutSource, fadingOutGain);
-            activeSource = activeGain = null;
-            pendingNextSource = pendingNextGain = null;
-            fadingOutSource = fadingOutGain = null;
+            await waitMetadata(el);
+            return url;
         }
 
-        async function ensureAudioGraph() {
-            if (!audioCtx) {
-                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                masterGain = audioCtx.createGain();
-                masterGain.gain.value = 1;
-                streamDest = audioCtx.createMediaStreamDestination();
-                // Une seule sortie : MediaStream → <audio>
-                // (évite le double son si on branchait aussi audioCtx.destination)
-                masterGain.connect(streamDest);
-                mediaEl.srcObject = streamDest.stream;
-                mediaEl.volume = 1;
-                mediaEl.muted = false;
-            }
-            if (audioCtx.state === 'suspended') await audioCtx.resume();
-            if (!mediaBridgeReady) {
-                bridgeSyncing = true;
-                try {
-                    await mediaEl.play();
-                    mediaBridgeReady = true;
-                } catch (e) {
-                    console.warn('Media bridge play() deferred', e);
-                } finally {
-                    bridgeSyncing = false;
-                }
-            }
-        }
-
-        async function ensureMediaBridgePlaying() {
-            if (!mediaEl.srcObject && streamDest) {
-                mediaEl.srcObject = streamDest.stream;
-            }
-            bridgeSyncing = true;
+        async function preloadStandby(nextIndex) {
+            if (nextIndex < 0 || nextIndex >= tracks.length) return;
             try {
-                if (mediaEl.paused) await mediaEl.play();
-                mediaBridgeReady = true;
-            } catch (_) {
-            } finally {
-                bridgeSyncing = false;
+                await prepareElement(standby, nextIndex);
+                standby.pause();
+                standby.currentTime = 0;
+            } catch (e) {
+                console.warn('preload failed', e);
             }
         }
 
-        function scheduleFollowing(gen, index, startTime, duration, currentGainNode) {
-            const endTime = startTime + duration;
-            const fade = Math.min(CROSSFADE_SEC, Math.max(0.01, duration / 3));
-            const fadeStart = endTime - fade;
+        function swapPlayers() {
+            const tmp = active;
+            active = standby;
+            standby = tmp;
+        }
 
-            if (index + 1 >= tracks.length) {
-                if (currentGainNode) {
-                    currentGainNode.gain.setValueAtTime(1, Math.max(audioCtx.currentTime, fadeStart));
-                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
-                }
-                transitionTimer = setTimeout(() => {
-                    if (gen !== playGeneration) return;
-                    isPlaying = false;
-                    pauseOffset = 0;
-                    statusEl.textContent = "Fin de l'album.";
-                    bridgeSyncing = true;
-                    try { mediaEl.pause(); } catch (_) {}
-                    bridgeSyncing = false;
-                    updateTransportUi();
-                    stopProgressLoop();
-                }, Math.max(0, (endTime - audioCtx.currentTime) * 1000));
-                return;
-            }
+        function maybeHandoff() {
+            if (!isPlaying || handoffArmed || seeking) return;
+            const dur = active.duration;
+            if (!Number.isFinite(dur) || dur <= 0) return;
+            const remain = dur - active.currentTime;
+            if (remain > HANDOFF_SEC) return;
+            if (currentIndex + 1 >= tracks.length) return;
 
-            getDecoded(index + 1).then(nextBuf => {
+            const nextIndex = currentIndex + 1;
+            const gen = playGeneration;
+            handoffArmed = true;
+
+            // La piste suivante est déjà sur standby : démarrer immédiatement
+            const startNext = async () => {
                 if (gen !== playGeneration) return;
-
-                const nextGain = audioCtx.createGain();
-                nextGain.gain.setValueAtTime(0, fadeStart);
-                nextGain.gain.linearRampToValueAtTime(1, endTime);
-                nextGain.connect(masterGain);
-
-                const ns = audioCtx.createBufferSource();
-                ns.buffer = nextBuf;
-                ns.connect(nextGain);
-                ns.start(fadeStart);
-
-                if (currentGainNode) {
-                    currentGainNode.gain.cancelScheduledValues(fadeStart);
-                    currentGainNode.gain.setValueAtTime(1, fadeStart);
-                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
-                }
-
-                pendingNextSource = ns;
-                pendingNextGain = nextGain;
-
-                transitionTimer = setTimeout(() => {
-                    if (gen !== playGeneration) return;
-
-                    fadingOutSource = activeSource;
-                    fadingOutGain = activeGain;
-                    activeSource = ns;
-                    activeGain = nextGain;
-                    pendingNextSource = null;
-                    pendingNextGain = null;
-
-                    currentIndex = index + 1;
-                    startedAtCtx = fadeStart;
-                    startedAtOffset = 0;
+                try {
+                    if (!standby.src) await prepareElement(standby, nextIndex);
+                    standby.currentTime = 0;
+                    await standby.play();
+                    if (gen !== playGeneration) {
+                        standby.pause();
+                        return;
+                    }
+                    // Coupe l'ancienne dès que la nouvelle joue (overlap minime = quasi gapless)
+                    syncing = true;
+                    try { active.pause(); } catch (_) {}
+                    syncing = false;
+                    swapPlayers();
+                    currentIndex = nextIndex;
                     pauseOffset = 0;
-                    pruneDecoded(currentIndex);
-                    if (currentIndex + 1 < tracks.length) getDecoded(currentIndex + 1);
-                    if (currentIndex + 2 < tracks.length) getDecoded(currentIndex + 2);
+                    handoffArmed = false;
                     statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
                     updateTransportUi();
-
-                    cleanupTimer = setTimeout(() => {
-                        killSourceGain(fadingOutSource, fadingOutGain);
-                        fadingOutSource = fadingOutGain = null;
-                    }, Math.max(0, (endTime - audioCtx.currentTime) * 1000 + 30));
-
-                    scheduleFollowing(gen, currentIndex, fadeStart, nextBuf.duration, activeGain);
-                }, Math.max(0, (fadeStart - audioCtx.currentTime) * 1000));
-            }).catch(err => {
-                console.error(err);
-                if (gen !== playGeneration) return;
-                statusEl.textContent = err.message || String(err);
-            });
+                    preloadStandby(currentIndex + 1);
+                } catch (e) {
+                    console.error(e);
+                    handoffArmed = false;
+                }
+            };
+            startNext();
         }
 
         async function playTrack(index, offset = 0) {
             if (!ready) return;
-            await ensureAudioGraph();
-            await ensureMediaBridgePlaying();
-
             const gen = ++playGeneration;
-            stopAllSources();
-            isPlaying = false;
+            handoffArmed = false;
             currentIndex = index;
+            isPlaying = false;
             statusEl.textContent = `Chargement : ${tracks[index].name}…`;
             updateTransportUi();
 
             try {
-                if (index + 1 < tracks.length) getDecoded(index + 1);
-                if (index + 2 < tracks.length) getDecoded(index + 2);
-                if (index - 1 >= 0) getDecoded(index - 1);
+                if (index + 1 < tracks.length) getBlobUrl(index + 1);
+                if (index - 1 >= 0) getBlobUrl(index - 1);
 
-                const buffer = await getDecoded(index);
+                syncing = true;
+                standby.pause();
+                await prepareElement(active, index);
                 if (gen !== playGeneration) return;
 
-                offset = Math.max(0, Math.min(offset, Math.max(0, buffer.duration - 0.05)));
-
-                const gain = audioCtx.createGain();
-                gain.gain.setValueAtTime(1, audioCtx.currentTime);
-                gain.connect(masterGain);
-
-                const source = audioCtx.createBufferSource();
-                source.buffer = buffer;
-                source.connect(gain);
-
-                const when = audioCtx.currentTime + 0.03;
-                source.start(when, offset);
-                activeSource = source;
-                activeGain = gain;
-                startedAtCtx = when;
-                startedAtOffset = offset;
+                offset = Math.max(0, Math.min(offset, Math.max(0, active.duration - 0.05)));
+                active.currentTime = offset;
                 pauseOffset = offset;
-                isPlaying = true;
+                await active.play();
+                syncing = false;
+                if (gen !== playGeneration) return;
 
+                isPlaying = true;
                 statusEl.textContent = `Piste ${index + 1} / ${tracks.length}`;
                 updateTransportUi();
                 startProgressLoop();
-                await ensureMediaBridgePlaying();
-                updateMediaSession();
-
-                const remaining = buffer.duration - offset;
-                scheduleFollowing(gen, index, when, remaining, gain);
-                pruneDecoded(index);
+                preloadStandby(index + 1);
             } catch (e) {
                 console.error(e);
+                syncing = false;
                 if (gen !== playGeneration) return;
                 isPlaying = false;
                 statusEl.textContent = e.message || String(e);
@@ -793,39 +663,13 @@
         function pause() {
             if (!isPlaying) return;
             pauseOffset = currentOffset();
-            const now = audioCtx.currentTime;
             playGeneration++;
-            if (transitionTimer) {
-                clearTimeout(transitionTimer);
-                transitionTimer = null;
-            }
-            if (cleanupTimer) {
-                clearTimeout(cleanupTimer);
-                cleanupTimer = null;
-            }
-            if (activeGain) {
-                try {
-                    activeGain.gain.cancelScheduledValues(now);
-                    activeGain.gain.setValueAtTime(Math.max(activeGain.gain.value, 0.0001), now);
-                    activeGain.gain.linearRampToValueAtTime(0.0001, now + 0.02);
-                } catch (_) {}
-            }
-            if (pendingNextSource || pendingNextGain) {
-                killSourceGain(pendingNextSource, pendingNextGain);
-                pendingNextSource = pendingNextGain = null;
-            }
-            const genAtPause = playGeneration;
-            setTimeout(() => {
-                if (playGeneration !== genAtPause) return;
-                killSourceGain(activeSource, activeGain);
-                killSourceGain(fadingOutSource, fadingOutGain);
-                activeSource = activeGain = null;
-                fadingOutSource = fadingOutGain = null;
-            }, 25);
+            handoffArmed = false;
+            syncing = true;
+            active.pause();
+            standby.pause();
+            syncing = false;
             isPlaying = false;
-            bridgeSyncing = true;
-            try { mediaEl.pause(); } catch (_) {}
-            bridgeSyncing = false;
             statusEl.textContent = 'En pause';
             updateTransportUi();
             stopProgressLoop();
@@ -838,13 +682,25 @@
                 pause();
                 return;
             }
+            if (active.src && pauseOffset > 0 && Number.isFinite(active.duration)) {
+                try {
+                    active.currentTime = pauseOffset;
+                    await active.play();
+                    isPlaying = true;
+                    statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
+                    updateTransportUi();
+                    startProgressLoop();
+                    preloadStandby(currentIndex + 1);
+                    return;
+                } catch (_) {}
+            }
             await playTrack(currentIndex, pauseOffset);
         }
 
         async function playPrev() {
             const pos = currentOffset();
             if (pos > 3) {
-                await playTrack(currentIndex, 0);
+                await seekTo(0);
                 return;
             }
             if (currentIndex <= 0) return;
@@ -856,46 +712,76 @@
             await playTrack(currentIndex + 1, 0);
         }
 
+        async function seekTo(offset) {
+            pauseOffset = offset;
+            if (!active.src) {
+                updateProgressUi();
+                updateMediaSession();
+                return;
+            }
+            try { active.currentTime = offset; } catch (_) {}
+            handoffArmed = false;
+            if (isPlaying) {
+                try { await active.play(); } catch (_) {}
+            }
+            updateProgressUi();
+            updateMediaSession();
+        }
+
+        function onActiveEnded() {
+            if (syncing) return;
+            // Si le handoff a déjà basculé, ended de l'ancienne piste est ignoré
+            if (handoffArmed) return;
+            if (currentIndex + 1 < tracks.length) {
+                playTrack(currentIndex + 1, 0);
+                return;
+            }
+            isPlaying = false;
+            pauseOffset = 0;
+            statusEl.textContent = "Fin de l'album.";
+            updateTransportUi();
+            stopProgressLoop();
+        }
+
+        audioA.addEventListener('ended', () => { if (active === audioA) onActiveEnded(); });
+        audioB.addEventListener('ended', () => { if (active === audioB) onActiveEnded(); });
+
+        function onMediaPause(el) {
+            if (syncing || el !== active) return;
+            if (!isPlaying) return;
+            pause();
+        }
+        function onMediaPlay(el) {
+            if (syncing || el !== active) return;
+            if (isPlaying || !ready) return;
+            togglePlayPause();
+        }
+        audioA.addEventListener('pause', () => onMediaPause(audioA));
+        audioB.addEventListener('pause', () => onMediaPause(audioB));
+        audioA.addEventListener('play', () => onMediaPlay(audioA));
+        audioB.addEventListener('play', () => onMediaPlay(audioB));
+
         seekEl.addEventListener('pointerdown', () => { seeking = true; });
         seekEl.addEventListener('input', () => {
             seeking = true;
             const dur = currentDuration();
-            if (dur > 0) {
-                timeCurrentEl.textContent = formatTime((Number(seekEl.value) / 1000) * dur);
-            }
+            if (dur > 0) timeCurrentEl.textContent = formatTime((Number(seekEl.value) / 1000) * dur);
         });
         seekEl.addEventListener('change', async () => {
             const dur = currentDuration();
             const offset = dur > 0 ? (Number(seekEl.value) / 1000) * dur : 0;
             seeking = false;
-            pauseOffset = offset;
-            if (isPlaying) {
-                await playTrack(currentIndex, offset);
-            } else {
-                updateProgressUi();
-                updateMediaSession();
-            }
+            await seekTo(offset);
         });
 
         function blurOnPointerUp(btn) {
             btn.addEventListener('pointerup', () => btn.blur());
             btn.addEventListener('pointercancel', () => btn.blur());
         }
-
         btnPlayPause.addEventListener('click', () => togglePlayPause());
         btnPrev.addEventListener('click', () => playPrev());
         btnNext.addEventListener('click', () => playNext());
         [btnPlayPause, btnPrev, btnNext].forEach(blurOnPointerUp);
-
-        // Relais des commandes media element (Bluetooth / OS) vers le moteur gapless
-        mediaEl.addEventListener('pause', () => {
-            if (bridgeSyncing) return;
-            if (isPlaying) pause();
-        });
-        mediaEl.addEventListener('play', () => {
-            if (bridgeSyncing) return;
-            if (!isPlaying && ready) togglePlayPause();
-        });
 
         (async function init() {
             try {
