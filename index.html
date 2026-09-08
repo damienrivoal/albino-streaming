@@ -54,12 +54,13 @@
         }
         .artwork {
             display: block;
-            width: 100%;
+            width: min(240px, 70%);
+            height: auto;
             aspect-ratio: 1 / 1;
-            object-fit: cover;
+            object-fit: contain;
             border-radius: 8px;
-            margin: 0 0 18px;
-            background: #111;
+            margin: 0 auto 18px;
+            background: transparent;
         }
         h1 {
             margin: 0 0 6px;
@@ -226,8 +227,9 @@
             }
             #status { margin-bottom: 10px; }
             .artwork {
-                border-radius: 0;
-                margin: 0 0 14px;
+                width: min(200px, 52vw);
+                border-radius: 8px;
+                margin: 8px auto 14px;
             }
             #trackTitle {
                 font-size: 1.05rem;
