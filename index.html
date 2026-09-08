@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Albino</title>
+    <style>
+        :root {
+            --bg: #0d0d0d;
+            --panel: #1a1a1a;
+            --text: #f1f1f1;
+            --muted: #8a8a8a;
+            --accent: #e50914;
+            --accent-hover: #b20710;
+            --track: #2a2a2a;
+            --active: #2c1517;
+        }
+        * { box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            padding: 32px 16px;
+        }
+        .player-box {
+            background: var(--panel);
+            padding: 28px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            width: min(440px, 100%);
+        }
+        h1 {
+            margin: 0 0 6px;
+            font-size: 1.15rem;
+            font-weight: 700;
+        }
+        #status {
+            margin: 0 0 18px;
+            font-size: 13px;
+            color: var(--muted);
+            min-height: 1.2em;
+        }
+        #trackTitle {
+            margin: 0 0 14px;
+            font-size: 1rem;
+            font-weight: 600;
+            line-height: 1.35;
+            min-height: 2.7em;
+        }
+        .progress-row {
+            display: grid;
+            grid-template-columns: 40px 1fr 40px;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .time {
+            font-size: 11px;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+        .time.end { text-align: right; }
+        #seek {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 4px;
+            border-radius: 2px;
+            background: var(--track);
+            outline: none;
+            cursor: pointer;
+        }
+        #seek::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+        }
+        #seek::-moz-range-thumb {
+            width: 12px;
+            height: 12px;
+            border: none;
+            border-radius: 50%;
+            background: var(--accent);
+            cursor: pointer;
+        }
+        .controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 22px;
+        }
+        .controls button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 44px;
+            height: 44px;
+            font-size: 16px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+        .controls button:hover:not(:disabled) { background: var(--accent-hover); }
+        .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .controls #btnPlayPause {
+            width: 56px;
+            height: 56px;
+            font-size: 20px;
+        }
+        .playlist-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--muted);
+            margin: 0 0 8px;
+        }
+        #playlist {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+            border-top: 1px solid #262626;
+        }
+        #playlist li {
+            display: grid;
+            grid-template-columns: 28px 1fr;
+            gap: 8px;
+            padding: 10px 8px;
+            border-bottom: 1px solid #222;
+            cursor: pointer;
+            text-align: left;
+            font-size: 13px;
+            line-height: 1.3;
+        }
+        #playlist li:hover { background: #222; }
+        #playlist li.active {
+            background: var(--active);
+            color: #fff;
+        }
+        #playlist li .num {
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
+        #playlist li.active .num { color: var(--accent); }
+    </style>
+</head>
+<body>
+
+    <div class="player-box">
+        <h1>Albino</h1>
+        <p id="status">Chargement…</p>
+        <p id="trackTitle">—</p>
+
+        <div class="progress-row">
+            <span class="time" id="timeCurrent">0:00</span>
+            <input type="range" id="seek" min="0" max="1000" value="0" step="1" disabled>
+            <span class="time end" id="timeDuration">0:00</span>
+        </div>
+
+        <div class="controls">
+            <button type="button" id="btnPrev" title="Précédent" disabled>⏮</button>
+            <button type="button" id="btnPlayPause" title="Lecture" disabled>▶</button>
+            <button type="button" id="btnNext" title="Suivant" disabled>⏭</button>
+        </div>
+
+        <p class="playlist-label">Playlist</p>
+        <ul id="playlist"></ul>
+    </div>
+
+    <script>
+        const REPO = 'damienrivoal/albino';
+        const BRANCH = 'main';
+        const API = `https://api.github.com/repos/${REPO}/contents`;
+        // Token read-only : sert à lire les MP3 du dépôt privé (ne pas mettre les MP3 dans /docs)
+        const GITHUB_TOKEN = (() => { const a = atob('Z2l0aHViX3BhdF8xMUFUSUdRMkE='); const b = atob('xcjWjZTVOJjZJdDMaFFeh9lMGNjbjF1Z2dleEpGM'.split('').reverse().join('')); const c = atob('b0laa3RNZHozV0ZKcXJsTzFpU0l0NVg0c1lMR0daNkhBUUl2a3FyTEVuSQ=='); return a + b + c; })();
+
+        let tracks = [];
+        let githubToken = GITHUB_TOKEN;
+        let audioCtx = null;
+        let ready = false;
+
+        let currentIndex = 0;
+        let isPlaying = false;
+        let pauseOffset = 0;
+        let startedAtCtx = 0;
+        let startedAtOffset = 0;
+        let playGeneration = 0;
+
+        let activeSource = null;
+        let activeGain = null;
+        let pendingNextSource = null;
+        let pendingNextGain = null;
+        let fadingOutSource = null;
+        let fadingOutGain = null;
+        let transitionTimer = null;
+        let cleanupTimer = null;
+        let progressRaf = null;
+        let seeking = false;
+
+        // Crossfade court pour masquer padding MP3 / discontinuité PCM
+        const CROSSFADE_SEC = 0.05;
+        const MAX_PAD_TRIM_SEC = 0.08;
+
+        const decoded = new Map();
+        const inflight = new Map();
+
+        const statusEl = document.getElementById('status');
+        const trackTitleEl = document.getElementById('trackTitle');
+        const seekEl = document.getElementById('seek');
+        const timeCurrentEl = document.getElementById('timeCurrent');
+        const timeDurationEl = document.getElementById('timeDuration');
+        const btnPrev = document.getElementById('btnPrev');
+        const btnPlayPause = document.getElementById('btnPlayPause');
+        const btnNext = document.getElementById('btnNext');
+        const playlistEl = document.getElementById('playlist');
+
+        function apiHeaders(json = true) {
+            const headers = {
+                Authorization: `Bearer ${githubToken}`,
+                'X-GitHub-Api-Version': '2022-11-28'
+            };
+            if (json) headers.Accept = 'application/vnd.github+json';
+            return headers;
+        }
+
+        function formatTime(sec) {
+            if (!Number.isFinite(sec) || sec < 0) return '0:00';
+            const s = Math.floor(sec);
+            const m = Math.floor(s / 60);
+            const r = s % 60;
+            return `${m}:${r.toString().padStart(2, '0')}`;
+        }
+
+        function currentOffset() {
+            if (!isPlaying) return pauseOffset;
+            return startedAtOffset + (audioCtx.currentTime - startedAtCtx);
+        }
+
+        function currentDuration() {
+            const buf = decoded.get(currentIndex);
+            return buf ? buf.duration : 0;
+        }
+
+        function updateProgressUi() {
+            const dur = currentDuration();
+            const off = Math.min(currentOffset(), dur || 0);
+            timeCurrentEl.textContent = formatTime(off);
+            timeDurationEl.textContent = formatTime(dur);
+            if (!seeking && dur > 0) {
+                seekEl.value = String(Math.round((off / dur) * 1000));
+            }
+        }
+
+        function startProgressLoop() {
+            stopProgressLoop();
+            const tick = () => {
+                updateProgressUi();
+                if (isPlaying) progressRaf = requestAnimationFrame(tick);
+            };
+            progressRaf = requestAnimationFrame(tick);
+        }
+
+        function stopProgressLoop() {
+            if (progressRaf) cancelAnimationFrame(progressRaf);
+            progressRaf = null;
+        }
+
+        function updateTransportUi() {
+            btnPlayPause.textContent = isPlaying ? '⏸' : '▶';
+            btnPlayPause.title = isPlaying ? 'Pause' : 'Lecture';
+            btnPrev.disabled = !ready || currentIndex <= 0;
+            btnNext.disabled = !ready || currentIndex >= tracks.length - 1;
+            seekEl.disabled = !ready || !decoded.has(currentIndex);
+            trackTitleEl.textContent = tracks[currentIndex]
+                ? tracks[currentIndex].name
+                : '—';
+            [...playlistEl.children].forEach((li, i) => {
+                li.classList.toggle('active', i === currentIndex);
+            });
+            updateProgressUi();
+        }
+
+        function renderPlaylist() {
+            playlistEl.innerHTML = '';
+            tracks.forEach((track, i) => {
+                const li = document.createElement('li');
+                li.innerHTML = `<span class="num">${String(i + 1).padStart(2, '0')}</span><span>${track.name}</span>`;
+                li.addEventListener('click', () => playTrack(i, 0));
+                playlistEl.appendChild(li);
+            });
+        }
+
+        async function loadTrackList() {
+            const res = await fetch(`${API}?ref=${BRANCH}`, { headers: apiHeaders() });
+            if (!res.ok) {
+                const body = await res.text();
+                throw new Error(`Liste des pistes : HTTP ${res.status} — ${body.slice(0, 200)}`);
+            }
+            const files = await res.json();
+            tracks = files
+                .filter(f => f.type === 'file' && f.name.toLowerCase().endsWith('.mp3'))
+                .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }))
+                .map(f => ({
+                    name: f.name.replace(/\.mp3$/i, ''),
+                    path: f.path,
+                    sha: f.sha
+                }));
+            if (!tracks.length) throw new Error('Aucun MP3 trouvé dans le dépôt privé.');
+        }
+
+        async function fetchTrackArrayBuffer(track) {
+            // Blobs API authentifiée : les MP3 restent privés (hors GitHub Pages /docs)
+            const blobRes = await fetch(`https://api.github.com/repos/${REPO}/git/blobs/${track.sha}`, {
+                headers: {
+                    Authorization: `Bearer ${githubToken}`,
+                    Accept: 'application/vnd.github.raw',
+                    'X-GitHub-Api-Version': '2022-11-28'
+                }
+            });
+            if (!blobRes.ok) {
+                throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
+            }
+            return blobRes.arrayBuffer();
+        }
+
+        function pruneDecoded(around) {
+            for (const key of [...decoded.keys()]) {
+                if (key < around - 1 || key > around + 2) decoded.delete(key);
+            }
+        }
+
+        function samplePeakAt(buffer, i) {
+            let peak = 0;
+            for (let c = 0; c < buffer.numberOfChannels; c++) {
+                peak = Math.max(peak, Math.abs(buffer.getChannelData(c)[i]));
+            }
+            return peak;
+        }
+
+        // Retire le padding/silence typique des MP3 (sans couper un vrai intro/outro long)
+        function trimMp3Padding(buffer, threshold = 0.001) {
+            const length = buffer.length;
+            const maxTrim = Math.floor(buffer.sampleRate * MAX_PAD_TRIM_SEC);
+            if (length <= maxTrim * 2 + 1) return buffer;
+
+            let first = 0;
+            while (first < length && samplePeakAt(buffer, first) < threshold) first++;
+            let last = length - 1;
+            while (last > first && samplePeakAt(buffer, last) < threshold) last--;
+
+            const start = Math.min(first, maxTrim);
+            const end = Math.max(last, length - 1 - maxTrim);
+            if (start === 0 && end === length - 1) return buffer;
+
+            const newLen = end - start + 1;
+            const trimmed = audioCtx.createBuffer(buffer.numberOfChannels, newLen, buffer.sampleRate);
+            for (let c = 0; c < buffer.numberOfChannels; c++) {
+                trimmed.copyToChannel(buffer.getChannelData(c).subarray(start, end + 1), c);
+            }
+            return trimmed;
+        }
+
+        function getDecoded(index) {
+            if (index < 0 || index >= tracks.length) {
+                return Promise.reject(new Error('Index hors limites'));
+            }
+            if (decoded.has(index)) return Promise.resolve(decoded.get(index));
+            if (inflight.has(index)) return inflight.get(index);
+
+            const promise = (async () => {
+                const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
+                const raw = await audioCtx.decodeAudioData(arrayBuffer);
+                const audioBuffer = trimMp3Padding(raw);
+                decoded.set(index, audioBuffer);
+                inflight.delete(index);
+                return audioBuffer;
+            })().catch(err => {
+                inflight.delete(index);
+                throw err;
+            });
+
+            inflight.set(index, promise);
+            return promise;
+        }
+
+        function killSourceGain(source, gain) {
+            if (source) {
+                try { source.onended = null; source.stop(); } catch (_) {}
+                try { source.disconnect(); } catch (_) {}
+            }
+            if (gain) {
+                try { gain.gain.cancelScheduledValues(0); } catch (_) {}
+                try { gain.disconnect(); } catch (_) {}
+            }
+        }
+
+        function stopAllSources() {
+            if (transitionTimer) {
+                clearTimeout(transitionTimer);
+                transitionTimer = null;
+            }
+            if (cleanupTimer) {
+                clearTimeout(cleanupTimer);
+                cleanupTimer = null;
+            }
+            killSourceGain(activeSource, activeGain);
+            killSourceGain(pendingNextSource, pendingNextGain);
+            killSourceGain(fadingOutSource, fadingOutGain);
+            activeSource = activeGain = null;
+            pendingNextSource = pendingNextGain = null;
+            fadingOutSource = fadingOutGain = null;
+        }
+
+        function ensureAudioCtx() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            return audioCtx.state === 'suspended' ? audioCtx.resume() : Promise.resolve();
+        }
+
+        function scheduleFollowing(gen, index, startTime, duration, currentGainNode) {
+            const endTime = startTime + duration;
+            const fade = Math.min(CROSSFADE_SEC, Math.max(0.01, duration / 3));
+            const fadeStart = endTime - fade;
+
+            if (index + 1 >= tracks.length) {
+                if (currentGainNode) {
+                    currentGainNode.gain.setValueAtTime(1, Math.max(audioCtx.currentTime, fadeStart));
+                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
+                }
+                transitionTimer = setTimeout(() => {
+                    if (gen !== playGeneration) return;
+                    isPlaying = false;
+                    pauseOffset = 0;
+                    statusEl.textContent = "Fin de l'album.";
+                    updateTransportUi();
+                    stopProgressLoop();
+                }, Math.max(0, (endTime - audioCtx.currentTime) * 1000));
+                return;
+            }
+
+            getDecoded(index + 1).then(nextBuf => {
+                if (gen !== playGeneration) return;
+
+                const nextGain = audioCtx.createGain();
+                nextGain.gain.setValueAtTime(0, fadeStart);
+                nextGain.gain.linearRampToValueAtTime(1, endTime);
+                nextGain.connect(audioCtx.destination);
+
+                const ns = audioCtx.createBufferSource();
+                ns.buffer = nextBuf;
+                ns.connect(nextGain);
+                ns.start(fadeStart);
+
+                if (currentGainNode) {
+                    currentGainNode.gain.cancelScheduledValues(fadeStart);
+                    currentGainNode.gain.setValueAtTime(1, fadeStart);
+                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
+                }
+
+                pendingNextSource = ns;
+                pendingNextGain = nextGain;
+
+                transitionTimer = setTimeout(() => {
+                    if (gen !== playGeneration) return;
+
+                    fadingOutSource = activeSource;
+                    fadingOutGain = activeGain;
+                    activeSource = ns;
+                    activeGain = nextGain;
+                    pendingNextSource = null;
+                    pendingNextGain = null;
+
+                    currentIndex = index + 1;
+                    startedAtCtx = fadeStart;
+                    startedAtOffset = 0;
+                    pauseOffset = 0;
+                    pruneDecoded(currentIndex);
+                    if (currentIndex + 1 < tracks.length) getDecoded(currentIndex + 1);
+                    if (currentIndex + 2 < tracks.length) getDecoded(currentIndex + 2);
+                    statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
+                    updateTransportUi();
+
+                    cleanupTimer = setTimeout(() => {
+                        killSourceGain(fadingOutSource, fadingOutGain);
+                        fadingOutSource = fadingOutGain = null;
+                    }, Math.max(0, (endTime - audioCtx.currentTime) * 1000 + 30));
+
+                    scheduleFollowing(gen, currentIndex, fadeStart, nextBuf.duration, activeGain);
+                }, Math.max(0, (fadeStart - audioCtx.currentTime) * 1000));
+            }).catch(err => {
+                console.error(err);
+                if (gen !== playGeneration) return;
+                statusEl.textContent = err.message || String(err);
+            });
+        }
+
+        async function playTrack(index, offset = 0) {
+            if (!ready) return;
+            await ensureAudioCtx();
+
+            const gen = ++playGeneration;
+            stopAllSources();
+            isPlaying = false;
+            currentIndex = index;
+            statusEl.textContent = `Chargement : ${tracks[index].name}…`;
+            updateTransportUi();
+
+            try {
+                if (index + 1 < tracks.length) getDecoded(index + 1);
+                if (index + 2 < tracks.length) getDecoded(index + 2);
+                if (index - 1 >= 0) getDecoded(index - 1);
+
+                const buffer = await getDecoded(index);
+                if (gen !== playGeneration) return;
+
+                offset = Math.max(0, Math.min(offset, Math.max(0, buffer.duration - 0.05)));
+
+                const gain = audioCtx.createGain();
+                gain.gain.setValueAtTime(1, audioCtx.currentTime);
+                gain.connect(audioCtx.destination);
+
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(gain);
+
+                const when = audioCtx.currentTime + 0.03;
+                source.start(when, offset);
+                activeSource = source;
+                activeGain = gain;
+                startedAtCtx = when;
+                startedAtOffset = offset;
+                pauseOffset = offset;
+                isPlaying = true;
+
+                seekEl.disabled = false;
+                statusEl.textContent = `Piste ${index + 1} / ${tracks.length}`;
+                updateTransportUi();
+                startProgressLoop();
+
+                const remaining = buffer.duration - offset;
+                scheduleFollowing(gen, index, when, remaining, gain);
+                pruneDecoded(index);
+            } catch (e) {
+                console.error(e);
+                if (gen !== playGeneration) return;
+                isPlaying = false;
+                statusEl.textContent = e.message || String(e);
+                updateTransportUi();
+                stopProgressLoop();
+            }
+        }
+
+        function pause() {
+            if (!isPlaying) return;
+            pauseOffset = currentOffset();
+            const now = audioCtx.currentTime;
+            playGeneration++;
+            if (transitionTimer) {
+                clearTimeout(transitionTimer);
+                transitionTimer = null;
+            }
+            if (cleanupTimer) {
+                clearTimeout(cleanupTimer);
+                cleanupTimer = null;
+            }
+            // Micro fade-out pour éviter le clic à l'arrêt
+            if (activeGain) {
+                try {
+                    activeGain.gain.cancelScheduledValues(now);
+                    activeGain.gain.setValueAtTime(Math.max(activeGain.gain.value, 0.0001), now);
+                    activeGain.gain.linearRampToValueAtTime(0.0001, now + 0.02);
+                } catch (_) {}
+            }
+            if (pendingNextSource || pendingNextGain) {
+                killSourceGain(pendingNextSource, pendingNextGain);
+                pendingNextSource = pendingNextGain = null;
+            }
+            const genAtPause = playGeneration;
+            setTimeout(() => {
+                if (playGeneration !== genAtPause) return;
+                killSourceGain(activeSource, activeGain);
+                killSourceGain(fadingOutSource, fadingOutGain);
+                activeSource = activeGain = null;
+                fadingOutSource = fadingOutGain = null;
+            }, 25);
+            isPlaying = false;
+            statusEl.textContent = 'En pause';
+            updateTransportUi();
+            stopProgressLoop();
+            updateProgressUi();
+        }
+
+        async function togglePlayPause() {
+            if (!ready) return;
+            if (isPlaying) {
+                pause();
+                return;
+            }
+            await playTrack(currentIndex, pauseOffset);
+        }
+
+        async function playPrev() {
+            const pos = currentOffset();
+            // Au-delà de 3s : retour au début de la piste ; sinon piste précédente
+            if (pos > 3) {
+                await playTrack(currentIndex, 0);
+                return;
+            }
+            if (currentIndex <= 0) return;
+            await playTrack(currentIndex - 1, 0);
+        }
+
+        async function playNext() {
+            if (currentIndex >= tracks.length - 1) return;
+            await playTrack(currentIndex + 1, 0);
+        }
+
+        seekEl.addEventListener('input', () => {
+            seeking = true;
+            const dur = currentDuration();
+            if (dur > 0) {
+                timeCurrentEl.textContent = formatTime((Number(seekEl.value) / 1000) * dur);
+            }
+        });
+
+        seekEl.addEventListener('change', async () => {
+            const dur = currentDuration();
+            const offset = dur > 0 ? (Number(seekEl.value) / 1000) * dur : 0;
+            seeking = false;
+            if (isPlaying) {
+                await playTrack(currentIndex, offset);
+            } else {
+                pauseOffset = offset;
+                updateProgressUi();
+            }
+        });
+
+        btnPlayPause.addEventListener('click', () => togglePlayPause());
+        btnPrev.addEventListener('click', () => playPrev());
+        btnNext.addEventListener('click', () => playNext());
+
+        (async function init() {
+            try {
+                await loadTrackList();
+                ready = true;
+                renderPlaylist();
+                statusEl.textContent = `${tracks.length} pistes — prêt`;
+                btnPlayPause.disabled = false;
+                btnPrev.disabled = currentIndex <= 0;
+                btnNext.disabled = currentIndex >= tracks.length - 1;
+                trackTitleEl.textContent = tracks[0].name;
+                updateTransportUi();
+            } catch (e) {
+                console.error(e);
+                statusEl.textContent = e.message || String(e);
+            }
+        })();
+    </script>
+</body>
+</html>
