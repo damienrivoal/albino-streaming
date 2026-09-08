@@ -159,14 +159,20 @@
         .controls button:hover:not(:disabled) { background: var(--accent-hover); }
         .controls button:active:not(:disabled) { transform: scale(0.96); }
         .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
-        .controls button:focus { outline: none; }
-        .controls button:focus:not(:focus-visible) {
-            outline: none;
-            box-shadow: none;
+        .controls button,
+        .controls button:focus,
+        .controls button:focus-visible,
+        .controls button:active {
+            outline: none !important;
+            box-shadow: none !important;
+            -webkit-tap-highlight-color: transparent;
         }
-        .controls button:focus-visible {
-            outline: 2px solid rgba(255, 255, 255, 0.7);
-            outline-offset: 3px;
+        /* Anneau de focus clavier uniquement (pas tactile) */
+        @media (hover: hover) and (pointer: fine) {
+            .controls button:focus-visible {
+                outline: 2px solid rgba(255, 255, 255, 0.7) !important;
+                outline-offset: 3px;
+            }
         }
         .controls #btnPlayPause {
             width: 64px;
@@ -774,14 +780,22 @@
             await seekTo(offset);
         });
 
-        function blurOnPointerUp(btn) {
-            btn.addEventListener('pointerup', () => btn.blur());
-            btn.addEventListener('pointercancel', () => btn.blur());
+        function clearButtonFocus(btn) {
+            const clear = () => { try { btn.blur(); } catch (_) {} };
+            btn.addEventListener('pointerup', clear);
+            btn.addEventListener('pointercancel', clear);
+            btn.addEventListener('touchend', clear, { passive: true });
+            btn.addEventListener('click', () => {
+                clear();
+                requestAnimationFrame(clear);
+                setTimeout(clear, 50);
+            });
         }
+
         btnPlayPause.addEventListener('click', () => togglePlayPause());
         btnPrev.addEventListener('click', () => playPrev());
         btnNext.addEventListener('click', () => playNext());
-        [btnPlayPause, btnPrev, btnNext].forEach(blurOnPointerUp);
+        [btnPlayPause, btnPrev, btnNext].forEach(clearButtonFocus);
 
         (async function init() {
             try {
