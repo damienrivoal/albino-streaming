@@ -617,10 +617,11 @@
                 masterGain = audioCtx.createGain();
                 masterGain.gain.value = 1;
                 streamDest = audioCtx.createMediaStreamDestination();
-                // Sortie haut-parleurs + pont MediaStream pour notifs / Bluetooth
-                masterGain.connect(audioCtx.destination);
+                // Une seule sortie : MediaStream → <audio>
+                // (évite le double son si on branchait aussi audioCtx.destination)
                 masterGain.connect(streamDest);
                 mediaEl.srcObject = streamDest.stream;
+                mediaEl.volume = 1;
                 mediaEl.muted = false;
             }
             if (audioCtx.state === 'suspended') await audioCtx.resume();
@@ -773,6 +774,8 @@
                 statusEl.textContent = `Piste ${index + 1} / ${tracks.length}`;
                 updateTransportUi();
                 startProgressLoop();
+                await ensureMediaBridgePlaying();
+                updateMediaSession();
 
                 const remaining = buffer.duration - offset;
                 scheduleFollowing(gen, index, when, remaining, gain);
