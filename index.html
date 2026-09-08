@@ -174,10 +174,20 @@
                 outline-offset: 3px;
             }
         }
+        .controls button svg {
+            width: 22px;
+            height: 22px;
+            display: block;
+            fill: currentColor;
+            pointer-events: none;
+        }
         .controls #btnPlayPause {
             width: 64px;
             height: 64px;
-            font-size: 22px;
+        }
+        .controls #btnPlayPause svg {
+            width: 28px;
+            height: 28px;
         }
         .playlist-label {
             font-size: 12px;
@@ -282,9 +292,15 @@
             </div>
 
             <div class="controls">
-                <button type="button" id="btnPrev" title="Précédent" aria-label="Précédent" disabled>⏮</button>
-                <button type="button" id="btnPlayPause" title="Lecture" aria-label="Lecture" disabled>▶</button>
-                <button type="button" id="btnNext" title="Suivant" aria-label="Suivant" disabled>⏭</button>
+                <button type="button" id="btnPrev" title="Précédent" aria-label="Précédent" disabled>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h2.5v12H6V6zm3.5 6 8.5 6V6l-8.5 6z"/></svg>
+                </button>
+                <button type="button" id="btnPlayPause" title="Lecture" aria-label="Lecture" disabled>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z"/></svg>
+                </button>
+                <button type="button" id="btnNext" title="Suivant" aria-label="Suivant" disabled>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 6H18v12h-2.5V6zM6 18l8.5-6L6 6v12z"/></svg>
+                </button>
             </div>
         </div>
 
@@ -302,8 +318,17 @@
         const artworkUrl = new URL('artwork.png', window.location.href).href;
         const GITHUB_TOKEN = (() => { const a = atob('Z2l0aHViX3BhdF8xMUFUSUdRMkE='); const b = atob('xcjWjZTVOJjZJdDMaFFeh9lMGNjbjF1Z2dleEpGM'.split('').reverse().join('')); const c = atob('b0laa3RNZHozV0ZKcXJsTzFpU0l0NVg0c1lMR0daNkhBUUl2a3FyTEVuSQ=='); return a + b + c; })();
 
-        // Pré-démarrage de la piste suivante juste avant la fin pour un enchaînement quasi gapless
+        // Mobile / tablette : <audio> (bandeau média). Desktop : Web Audio gapless réel.
+        const USE_HTML_ENGINE = (() => {
+            const ua = navigator.userAgent || '';
+            if (/Android|iPhone|iPad|iPod/i.test(ua)) return true;
+            if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) return true;
+            return false;
+        })();
+
         const HANDOFF_SEC = 0.08;
+        const CROSSFADE_SEC = 0.05;
+        const MAX_PAD_TRIM_SEC = 0.08;
 
         let tracks = [];
         let githubToken = GITHUB_TOKEN;
@@ -315,16 +340,31 @@
         let playGeneration = 0;
         let progressRaf = null;
         let seeking = false;
+
+        // --- HTML engine state ---
         let handoffArmed = false;
         let syncing = false;
-
         const blobUrls = new Map();
-        const inflight = new Map();
-
+        const inflightBlobs = new Map();
         const audioA = document.getElementById('playerAudioA');
         const audioB = document.getElementById('playerAudioB');
         let active = audioA;
         let standby = audioB;
+
+        // --- Web Audio engine state ---
+        let audioCtx = null;
+        let startedAtCtx = 0;
+        let startedAtOffset = 0;
+        let activeSource = null;
+        let activeGain = null;
+        let pendingNextSource = null;
+        let pendingNextGain = null;
+        let fadingOutSource = null;
+        let fadingOutGain = null;
+        let transitionTimer = null;
+        let cleanupTimer = null;
+        const decoded = new Map();
+        const inflightDecoded = new Map();
 
         const statusEl = document.getElementById('status');
         const trackTitleEl = document.getElementById('trackTitle');
@@ -354,13 +394,20 @@
         }
 
         function currentOffset() {
-            if (isPlaying && Number.isFinite(active.currentTime)) return active.currentTime;
-            return pauseOffset;
+            if (USE_HTML_ENGINE) {
+                if (isPlaying && Number.isFinite(active.currentTime)) return active.currentTime;
+                return pauseOffset;
+            }
+            if (!isPlaying || !audioCtx) return pauseOffset;
+            return Math.max(0, startedAtOffset + (audioCtx.currentTime - startedAtCtx));
         }
 
         function currentDuration() {
-            if (Number.isFinite(active.duration) && active.duration > 0) return active.duration;
-            return 0;
+            if (USE_HTML_ENGINE) {
+                return (Number.isFinite(active.duration) && active.duration > 0) ? active.duration : 0;
+            }
+            const buf = decoded.get(currentIndex);
+            return buf ? buf.duration : 0;
         }
 
         function updateProgressUi() {
@@ -379,7 +426,7 @@
             try {
                 navigator.mediaSession.setPositionState({
                     duration: dur,
-                    playbackRate: active.playbackRate || 1,
+                    playbackRate: 1,
                     position: Math.min(Math.max(0, currentOffset()), dur)
                 });
             } catch (_) {}
@@ -414,7 +461,6 @@
             bind('stop', () => {
                 pause();
                 pauseOffset = 0;
-                try { active.currentTime = 0; } catch (_) {}
                 updateProgressUi();
                 updateMediaSession();
             });
@@ -426,13 +472,11 @@
             });
             bind('seekforward', (d) => {
                 const skip = (d && d.seekOffset) || 10;
-                const dur = currentDuration() || 0;
-                seekTo(Math.min(dur, currentOffset() + skip));
+                seekTo(Math.min(currentDuration() || 0, currentOffset() + skip));
             });
             bind('seekto', (d) => {
                 if (!d || d.seekTime == null) return;
-                const dur = currentDuration() || 0;
-                seekTo(Math.min(Math.max(0, d.seekTime), dur));
+                seekTo(Math.min(Math.max(0, d.seekTime), currentDuration() || 0));
             });
         }
 
@@ -441,7 +485,7 @@
             let lastMediaPosAt = 0;
             const tick = () => {
                 updateProgressUi();
-                maybeHandoff();
+                if (USE_HTML_ENGINE) maybeHandoff();
                 const now = performance.now();
                 if (now - lastMediaPosAt > 500) {
                     updateMediaPosition();
@@ -458,12 +502,17 @@
         }
 
         function updateTransportUi() {
-            btnPlayPause.textContent = isPlaying ? '⏸' : '▶';
+            btnPlayPause.innerHTML = isPlaying
+                ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6V5zm8 0h4v14h-4V5z"/></svg>'
+                : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z"/></svg>';
             btnPlayPause.title = isPlaying ? 'Pause' : 'Lecture';
             btnPlayPause.setAttribute('aria-label', isPlaying ? 'Pause' : 'Lecture');
             btnPrev.disabled = !ready || currentIndex <= 0;
             btnNext.disabled = !ready || currentIndex >= tracks.length - 1;
-            seekEl.disabled = !ready || !(Number.isFinite(active.duration) && active.duration > 0);
+            const canSeek = USE_HTML_ENGINE
+                ? (Number.isFinite(active.duration) && active.duration > 0)
+                : decoded.has(currentIndex);
+            seekEl.disabled = !ready || !canSeek;
             trackTitleEl.textContent = tracks[currentIndex] ? tracks[currentIndex].name : '—';
             document.title = tracks[currentIndex]
                 ? `${tracks[currentIndex].name} — Brainsucked Society`
@@ -513,6 +562,8 @@
             return blobRes.arrayBuffer();
         }
 
+        // ===================== HTML engine (mobile) =====================
+
         function pruneBlobUrls(around) {
             for (const key of [...blobUrls.keys()]) {
                 if (key < around - 1 || key > around + 2) {
@@ -525,20 +576,16 @@
         function getBlobUrl(index) {
             if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
             if (blobUrls.has(index)) return Promise.resolve(blobUrls.get(index));
-            if (inflight.has(index)) return inflight.get(index);
-
+            if (inflightBlobs.has(index)) return inflightBlobs.get(index);
             const promise = (async () => {
                 const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
                 const url = URL.createObjectURL(new Blob([arrayBuffer], { type: 'audio/mpeg' }));
                 blobUrls.set(index, url);
-                inflight.delete(index);
+                inflightBlobs.delete(index);
                 pruneBlobUrls(index);
                 return url;
-            })().catch(err => {
-                inflight.delete(index);
-                throw err;
-            });
-            inflight.set(index, promise);
+            })().catch(err => { inflightBlobs.delete(index); throw err; });
+            inflightBlobs.set(index, promise);
             return promise;
         }
 
@@ -563,7 +610,6 @@
                 el.load();
             }
             await waitMetadata(el);
-            return url;
         }
 
         async function preloadStandby(nextIndex) {
@@ -587,16 +633,14 @@
             if (!isPlaying || handoffArmed || seeking) return;
             const dur = active.duration;
             if (!Number.isFinite(dur) || dur <= 0) return;
-            const remain = dur - active.currentTime;
-            if (remain > HANDOFF_SEC) return;
+            if (dur - active.currentTime > HANDOFF_SEC) return;
             if (currentIndex + 1 >= tracks.length) return;
 
             const nextIndex = currentIndex + 1;
             const gen = playGeneration;
             handoffArmed = true;
 
-            // La piste suivante est déjà sur standby : démarrer immédiatement
-            const startNext = async () => {
+            (async () => {
                 if (gen !== playGeneration) return;
                 try {
                     if (!standby.src) await prepareElement(standby, nextIndex);
@@ -606,7 +650,6 @@
                         standby.pause();
                         return;
                     }
-                    // Coupe l'ancienne dès que la nouvelle joue (overlap minime = quasi gapless)
                     syncing = true;
                     try { active.pause(); } catch (_) {}
                     syncing = false;
@@ -621,12 +664,10 @@
                     console.error(e);
                     handoffArmed = false;
                 }
-            };
-            startNext();
+            })();
         }
 
-        async function playTrack(index, offset = 0) {
-            if (!ready) return;
+        async function playTrackHtml(index, offset = 0) {
             const gen = ++playGeneration;
             handoffArmed = false;
             currentIndex = index;
@@ -666,7 +707,7 @@
             }
         }
 
-        function pause() {
+        function pauseHtml() {
             if (!isPlaying) return;
             pauseOffset = currentOffset();
             playGeneration++;
@@ -682,13 +723,251 @@
             updateProgressUi();
         }
 
+        // ===================== Web Audio engine (desktop gapless) =====================
+
+        function pruneDecoded(around) {
+            for (const key of [...decoded.keys()]) {
+                if (key < around - 1 || key > around + 2) decoded.delete(key);
+            }
+        }
+
+        function samplePeakAt(buffer, i) {
+            let peak = 0;
+            for (let c = 0; c < buffer.numberOfChannels; c++) {
+                peak = Math.max(peak, Math.abs(buffer.getChannelData(c)[i]));
+            }
+            return peak;
+        }
+
+        function trimMp3Padding(buffer, threshold = 0.001) {
+            const length = buffer.length;
+            const maxTrim = Math.floor(buffer.sampleRate * MAX_PAD_TRIM_SEC);
+            if (length <= maxTrim * 2 + 1) return buffer;
+            let first = 0;
+            while (first < length && samplePeakAt(buffer, first) < threshold) first++;
+            let last = length - 1;
+            while (last > first && samplePeakAt(buffer, last) < threshold) last--;
+            const start = Math.min(first, maxTrim);
+            const end = Math.max(last, length - 1 - maxTrim);
+            if (start === 0 && end === length - 1) return buffer;
+            const newLen = end - start + 1;
+            const trimmed = audioCtx.createBuffer(buffer.numberOfChannels, newLen, buffer.sampleRate);
+            for (let c = 0; c < buffer.numberOfChannels; c++) {
+                trimmed.copyToChannel(buffer.getChannelData(c).subarray(start, end + 1), c);
+            }
+            return trimmed;
+        }
+
+        function getDecoded(index) {
+            if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
+            if (decoded.has(index)) return Promise.resolve(decoded.get(index));
+            if (inflightDecoded.has(index)) return inflightDecoded.get(index);
+            const promise = (async () => {
+                const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
+                const raw = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                const audioBuffer = trimMp3Padding(raw);
+                decoded.set(index, audioBuffer);
+                inflightDecoded.delete(index);
+                return audioBuffer;
+            })().catch(err => { inflightDecoded.delete(index); throw err; });
+            inflightDecoded.set(index, promise);
+            return promise;
+        }
+
+        function killSourceGain(source, gain) {
+            if (source) {
+                try { source.onended = null; source.stop(); } catch (_) {}
+                try { source.disconnect(); } catch (_) {}
+            }
+            if (gain) {
+                try { gain.gain.cancelScheduledValues(audioCtx ? audioCtx.currentTime : 0); } catch (_) {}
+                try { gain.disconnect(); } catch (_) {}
+            }
+        }
+
+        function stopAllSources() {
+            if (transitionTimer) { clearTimeout(transitionTimer); transitionTimer = null; }
+            if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
+            killSourceGain(activeSource, activeGain);
+            killSourceGain(pendingNextSource, pendingNextGain);
+            killSourceGain(fadingOutSource, fadingOutGain);
+            activeSource = activeGain = null;
+            pendingNextSource = pendingNextGain = null;
+            fadingOutSource = fadingOutGain = null;
+        }
+
+        async function ensureAudioCtx() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+        }
+
+        function scheduleFollowing(gen, index, startTime, duration, currentGainNode) {
+            const endTime = startTime + duration;
+            const fade = Math.min(CROSSFADE_SEC, Math.max(0.01, duration / 3));
+            const fadeStart = endTime - fade;
+
+            if (index + 1 >= tracks.length) {
+                if (currentGainNode) {
+                    currentGainNode.gain.setValueAtTime(1, Math.max(audioCtx.currentTime, fadeStart));
+                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
+                }
+                transitionTimer = setTimeout(() => {
+                    if (gen !== playGeneration) return;
+                    isPlaying = false;
+                    pauseOffset = 0;
+                    statusEl.textContent = "Fin de l'album.";
+                    updateTransportUi();
+                    stopProgressLoop();
+                }, Math.max(0, (endTime - audioCtx.currentTime) * 1000));
+                return;
+            }
+
+            getDecoded(index + 1).then(nextBuf => {
+                if (gen !== playGeneration) return;
+                const nextGain = audioCtx.createGain();
+                nextGain.gain.setValueAtTime(0, fadeStart);
+                nextGain.gain.linearRampToValueAtTime(1, endTime);
+                nextGain.connect(audioCtx.destination);
+                const ns = audioCtx.createBufferSource();
+                ns.buffer = nextBuf;
+                ns.connect(nextGain);
+                ns.start(fadeStart);
+                if (currentGainNode) {
+                    currentGainNode.gain.cancelScheduledValues(fadeStart);
+                    currentGainNode.gain.setValueAtTime(1, fadeStart);
+                    currentGainNode.gain.linearRampToValueAtTime(0.0001, endTime);
+                }
+                pendingNextSource = ns;
+                pendingNextGain = nextGain;
+                transitionTimer = setTimeout(() => {
+                    if (gen !== playGeneration) return;
+                    fadingOutSource = activeSource;
+                    fadingOutGain = activeGain;
+                    activeSource = ns;
+                    activeGain = nextGain;
+                    pendingNextSource = pendingNextGain = null;
+                    currentIndex = index + 1;
+                    startedAtCtx = fadeStart;
+                    startedAtOffset = 0;
+                    pauseOffset = 0;
+                    pruneDecoded(currentIndex);
+                    if (currentIndex + 1 < tracks.length) getDecoded(currentIndex + 1);
+                    if (currentIndex + 2 < tracks.length) getDecoded(currentIndex + 2);
+                    statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
+                    updateTransportUi();
+                    cleanupTimer = setTimeout(() => {
+                        killSourceGain(fadingOutSource, fadingOutGain);
+                        fadingOutSource = fadingOutGain = null;
+                    }, Math.max(0, (endTime - audioCtx.currentTime) * 1000 + 30));
+                    scheduleFollowing(gen, currentIndex, fadeStart, nextBuf.duration, activeGain);
+                }, Math.max(0, (fadeStart - audioCtx.currentTime) * 1000));
+            }).catch(err => {
+                console.error(err);
+                if (gen !== playGeneration) return;
+                statusEl.textContent = err.message || String(err);
+            });
+        }
+
+        async function playTrackWebAudio(index, offset = 0) {
+            await ensureAudioCtx();
+            const gen = ++playGeneration;
+            stopAllSources();
+            isPlaying = false;
+            currentIndex = index;
+            statusEl.textContent = `Chargement : ${tracks[index].name}…`;
+            updateTransportUi();
+
+            try {
+                if (index + 1 < tracks.length) getDecoded(index + 1);
+                if (index + 2 < tracks.length) getDecoded(index + 2);
+                if (index - 1 >= 0) getDecoded(index - 1);
+
+                const buffer = await getDecoded(index);
+                if (gen !== playGeneration) return;
+
+                offset = Math.max(0, Math.min(offset, Math.max(0, buffer.duration - 0.05)));
+                const gain = audioCtx.createGain();
+                gain.gain.setValueAtTime(1, audioCtx.currentTime);
+                gain.connect(audioCtx.destination);
+                const source = audioCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(gain);
+                const when = audioCtx.currentTime + 0.03;
+                source.start(when, offset);
+                activeSource = source;
+                activeGain = gain;
+                startedAtCtx = when;
+                startedAtOffset = offset;
+                pauseOffset = offset;
+                isPlaying = true;
+                statusEl.textContent = `Piste ${index + 1} / ${tracks.length}`;
+                updateTransportUi();
+                startProgressLoop();
+                scheduleFollowing(gen, index, when, buffer.duration - offset, gain);
+                pruneDecoded(index);
+            } catch (e) {
+                console.error(e);
+                if (gen !== playGeneration) return;
+                isPlaying = false;
+                statusEl.textContent = e.message || String(e);
+                updateTransportUi();
+                stopProgressLoop();
+            }
+        }
+
+        function pauseWebAudio() {
+            if (!isPlaying) return;
+            pauseOffset = currentOffset();
+            const now = audioCtx.currentTime;
+            playGeneration++;
+            if (transitionTimer) { clearTimeout(transitionTimer); transitionTimer = null; }
+            if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
+            if (activeGain) {
+                try {
+                    activeGain.gain.cancelScheduledValues(now);
+                    activeGain.gain.setValueAtTime(Math.max(activeGain.gain.value, 0.0001), now);
+                    activeGain.gain.linearRampToValueAtTime(0.0001, now + 0.02);
+                } catch (_) {}
+            }
+            if (pendingNextSource || pendingNextGain) {
+                killSourceGain(pendingNextSource, pendingNextGain);
+                pendingNextSource = pendingNextGain = null;
+            }
+            const genAtPause = playGeneration;
+            setTimeout(() => {
+                if (playGeneration !== genAtPause) return;
+                killSourceGain(activeSource, activeGain);
+                killSourceGain(fadingOutSource, fadingOutGain);
+                activeSource = activeGain = null;
+                fadingOutSource = fadingOutGain = null;
+            }, 25);
+            isPlaying = false;
+            statusEl.textContent = 'En pause';
+            updateTransportUi();
+            stopProgressLoop();
+            updateProgressUi();
+        }
+
+        // ===================== Shared API =====================
+
+        async function playTrack(index, offset = 0) {
+            if (!ready) return;
+            if (USE_HTML_ENGINE) return playTrackHtml(index, offset);
+            return playTrackWebAudio(index, offset);
+        }
+
+        function pause() {
+            if (USE_HTML_ENGINE) return pauseHtml();
+            return pauseWebAudio();
+        }
+
         async function togglePlayPause() {
             if (!ready) return;
             if (isPlaying) {
                 pause();
                 return;
             }
-            if (active.src && pauseOffset > 0 && Number.isFinite(active.duration)) {
+            if (USE_HTML_ENGINE && active.src && pauseOffset > 0 && Number.isFinite(active.duration)) {
                 try {
                     active.currentTime = pauseOffset;
                     await active.play();
@@ -706,7 +985,8 @@
         async function playPrev() {
             const pos = currentOffset();
             if (pos > 3) {
-                await seekTo(0);
+                if (USE_HTML_ENGINE) await seekTo(0);
+                else await playTrack(currentIndex, 0);
                 return;
             }
             if (currentIndex <= 0) return;
@@ -720,24 +1000,30 @@
 
         async function seekTo(offset) {
             pauseOffset = offset;
-            if (!active.src) {
+            if (USE_HTML_ENGINE) {
+                if (!active.src) {
+                    updateProgressUi();
+                    updateMediaSession();
+                    return;
+                }
+                try { active.currentTime = offset; } catch (_) {}
+                handoffArmed = false;
+                if (isPlaying) {
+                    try { await active.play(); } catch (_) {}
+                }
                 updateProgressUi();
                 updateMediaSession();
                 return;
             }
-            try { active.currentTime = offset; } catch (_) {}
-            handoffArmed = false;
-            if (isPlaying) {
-                try { await active.play(); } catch (_) {}
+            if (isPlaying) await playTrack(currentIndex, offset);
+            else {
+                updateProgressUi();
+                updateMediaSession();
             }
-            updateProgressUi();
-            updateMediaSession();
         }
 
         function onActiveEnded() {
-            if (syncing) return;
-            // Si le handoff a déjà basculé, ended de l'ancienne piste est ignoré
-            if (handoffArmed) return;
+            if (syncing || handoffArmed) return;
             if (currentIndex + 1 < tracks.length) {
                 playTrack(currentIndex + 1, 0);
                 return;
@@ -749,23 +1035,22 @@
             stopProgressLoop();
         }
 
-        audioA.addEventListener('ended', () => { if (active === audioA) onActiveEnded(); });
-        audioB.addEventListener('ended', () => { if (active === audioB) onActiveEnded(); });
-
-        function onMediaPause(el) {
-            if (syncing || el !== active) return;
-            if (!isPlaying) return;
-            pause();
+        if (USE_HTML_ENGINE) {
+            audioA.addEventListener('ended', () => { if (active === audioA) onActiveEnded(); });
+            audioB.addEventListener('ended', () => { if (active === audioB) onActiveEnded(); });
+            audioA.addEventListener('pause', () => {
+                if (!syncing && active === audioA && isPlaying) pause();
+            });
+            audioB.addEventListener('pause', () => {
+                if (!syncing && active === audioB && isPlaying) pause();
+            });
+            audioA.addEventListener('play', () => {
+                if (!syncing && active === audioA && !isPlaying && ready) togglePlayPause();
+            });
+            audioB.addEventListener('play', () => {
+                if (!syncing && active === audioB && !isPlaying && ready) togglePlayPause();
+            });
         }
-        function onMediaPlay(el) {
-            if (syncing || el !== active) return;
-            if (isPlaying || !ready) return;
-            togglePlayPause();
-        }
-        audioA.addEventListener('pause', () => onMediaPause(audioA));
-        audioB.addEventListener('pause', () => onMediaPause(audioB));
-        audioA.addEventListener('play', () => onMediaPlay(audioA));
-        audioB.addEventListener('play', () => onMediaPlay(audioB));
 
         seekEl.addEventListener('pointerdown', () => { seeking = true; });
         seekEl.addEventListener('input', () => {
@@ -803,7 +1088,8 @@
                 ready = true;
                 setupMediaSessionHandlers();
                 renderPlaylist();
-                statusEl.textContent = `${tracks.length} pistes — prêt`;
+                const mode = USE_HTML_ENGINE ? 'mobile (bandeau média)' : 'desktop (gapless)';
+                statusEl.textContent = `${tracks.length} pistes — prêt · ${mode}`;
                 btnPlayPause.disabled = false;
                 btnPrev.disabled = currentIndex <= 0;
                 btnNext.disabled = currentIndex >= tracks.length - 1;
