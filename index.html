@@ -510,7 +510,7 @@
                 : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7L8 5z"/></svg>';
             btnPlayPause.title = isPlaying ? 'Pause' : 'Lecture';
             btnPlayPause.setAttribute('aria-label', isPlaying ? 'Pause' : 'Lecture');
-            btnPrev.disabled = !ready || currentIndex <= 0;
+            btnPrev.disabled = !ready;
             btnNext.disabled = !ready || currentIndex >= tracks.length - 1;
             const canSeek = USE_HTML_ENGINE
                 ? (Number.isFinite(active.duration) && active.duration > 0)
@@ -1052,12 +1052,12 @@
 
         async function playPrev() {
             const pos = currentOffset();
-            if (pos > 3) {
+            // > 3s (ou piste 1) : retour au début ; sinon piste précédente
+            if (pos > 3 || currentIndex <= 0) {
                 if (USE_HTML_ENGINE) await seekTo(0);
                 else await playTrack(currentIndex, 0);
                 return;
             }
-            if (currentIndex <= 0) return;
             await playTrack(currentIndex - 1, 0);
         }
 
@@ -1158,7 +1158,7 @@
                 renderPlaylist();
                 statusEl.textContent = `${tracks.length} pistes — prêt`;
                 btnPlayPause.disabled = false;
-                btnPrev.disabled = currentIndex <= 0;
+                btnPrev.disabled = false;
                 btnNext.disabled = currentIndex >= tracks.length - 1;
                 trackTitleEl.textContent = tracks[0].name;
                 updateTransportUi();
