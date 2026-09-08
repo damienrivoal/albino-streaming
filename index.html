@@ -625,11 +625,14 @@
             }
             if (audioCtx.state === 'suspended') await audioCtx.resume();
             if (!mediaBridgeReady) {
+                bridgeSyncing = true;
                 try {
                     await mediaEl.play();
                     mediaBridgeReady = true;
                 } catch (e) {
                     console.warn('Media bridge play() deferred', e);
+                } finally {
+                    bridgeSyncing = false;
                 }
             }
         }
@@ -663,7 +666,9 @@
                     isPlaying = false;
                     pauseOffset = 0;
                     statusEl.textContent = "Fin de l'album.";
+                    bridgeSyncing = true;
                     try { mediaEl.pause(); } catch (_) {}
+                    bridgeSyncing = false;
                     updateTransportUi();
                     stopProgressLoop();
                 }, Math.max(0, (endTime - audioCtx.currentTime) * 1000));
