@@ -326,7 +326,9 @@
             return false;
         })();
 
-        const HANDOFF_SEC = 0.08;
+        // Mobile HTML : anticiper + léger overlap. Desktop Web Audio garde CROSSFADE_SEC.
+        const HANDOFF_SEC = 0.28;
+        const HTML_CROSSFADE_SEC = 0.2;
         const CROSSFADE_SEC = 0.05;
         const MAX_PAD_TRIM_SEC = 0.08;
 
@@ -344,6 +346,7 @@
         // --- HTML engine state ---
         let handoffArmed = false;
         let syncing = false;
+        let crossfadeRaf = null;
         const blobUrls = new Map();
         const inflightBlobs = new Map();
         const audioA = document.getElementById('playerAudioA');
@@ -629,6 +632,47 @@
             standby = tmp;
         }
 
+        function setHtmlVolume(el, v) {
+            try { el.volume = Math.max(0, Math.min(1, v)); } catch (_) {}
+        }
+
+        function resetHtmlVolumes() {
+            setHtmlVolume(audioA, 1);
+            setHtmlVolume(audioB, 1);
+        }
+
+        function cancelHtmlCrossfade() {
+            if (crossfadeRaf != null) {
+                cancelAnimationFrame(crossfadeRaf);
+                crossfadeRaf = null;
+            }
+        }
+
+        function crossfadeHtmlVolumes(fromEl, toEl, durationSec) {
+            return new Promise((resolve) => {
+                cancelHtmlCrossfade();
+                const start = performance.now();
+                const durMs = Math.max(32, durationSec * 1000);
+                setHtmlVolume(fromEl, 1);
+                setHtmlVolume(toEl, 0);
+                const step = (now) => {
+                    const t = Math.min(1, (now - start) / durMs);
+                    // Equal-power : plus doux qu'un fade linéaire sur un court overlap.
+                    const fadeOut = Math.cos(t * Math.PI / 2);
+                    const fadeIn = Math.sin(t * Math.PI / 2);
+                    setHtmlVolume(fromEl, fadeOut);
+                    setHtmlVolume(toEl, fadeIn);
+                    if (t < 1) {
+                        crossfadeRaf = requestAnimationFrame(step);
+                    } else {
+                        crossfadeRaf = null;
+                        resolve();
+                    }
+                };
+                crossfadeRaf = requestAnimationFrame(step);
+            });
+        }
+
         function maybeHandoff() {
             if (!isPlaying || handoffArmed || seeking) return;
             const dur = active.duration;
@@ -644,14 +688,31 @@
                 if (gen !== playGeneration) return;
                 try {
                     if (!standby.src) await prepareElement(standby, nextIndex);
+                    if (gen !== playGeneration) return;
+
                     standby.currentTime = 0;
+                    setHtmlVolume(active, 1);
+                    setHtmlVolume(standby, 0);
                     await standby.play();
                     if (gen !== playGeneration) {
-                        standby.pause();
+                        try { standby.pause(); } catch (_) {}
+                        resetHtmlVolumes();
+                        handoffArmed = false;
                         return;
                     }
+
+                    const fadeSec = Math.min(HTML_CROSSFADE_SEC, Math.max(0.05, dur - active.currentTime));
+                    await crossfadeHtmlVolumes(active, standby, fadeSec);
+                    if (gen !== playGeneration) {
+                        try { standby.pause(); } catch (_) {}
+                        resetHtmlVolumes();
+                        handoffArmed = false;
+                        return;
+                    }
+
                     syncing = true;
                     try { active.pause(); } catch (_) {}
+                    resetHtmlVolumes();
                     syncing = false;
                     swapPlayers();
                     currentIndex = nextIndex;
@@ -662,6 +723,8 @@
                     preloadStandby(currentIndex + 1);
                 } catch (e) {
                     console.error(e);
+                    cancelHtmlCrossfade();
+                    resetHtmlVolumes();
                     handoffArmed = false;
                 }
             })();
@@ -669,6 +732,8 @@
 
         async function playTrackHtml(index, offset = 0) {
             const gen = ++playGeneration;
+            cancelHtmlCrossfade();
+            resetHtmlVolumes();
             handoffArmed = false;
             currentIndex = index;
             isPlaying = false;
@@ -687,6 +752,7 @@
                 offset = Math.max(0, Math.min(offset, Math.max(0, active.duration - 0.05)));
                 active.currentTime = offset;
                 pauseOffset = offset;
+                setHtmlVolume(active, 1);
                 await active.play();
                 syncing = false;
                 if (gen !== playGeneration) return;
@@ -712,9 +778,11 @@
             pauseOffset = currentOffset();
             playGeneration++;
             handoffArmed = false;
+            cancelHtmlCrossfade();
             syncing = true;
             active.pause();
             standby.pause();
+            resetHtmlVolumes();
             syncing = false;
             isPlaying = false;
             statusEl.textContent = 'En pause';
