@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#0d0d0d">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <title>Albino</title>
+    <title>Brainsucked Society</title>
     <style>
         :root {
             --bg: #0d0d0d;
@@ -47,6 +47,15 @@
         }
         .player-top {
             margin-bottom: 8px;
+        }
+        .artwork {
+            display: block;
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            object-fit: cover;
+            border-radius: 8px;
+            margin: 0 0 18px;
+            background: #111;
         }
         h1 {
             margin: 0 0 6px;
@@ -212,6 +221,10 @@
                 border-bottom: 1px solid #262626;
             }
             #status { margin-bottom: 10px; }
+            .artwork {
+                border-radius: 0;
+                margin: 0 0 14px;
+            }
             #trackTitle {
                 font-size: 1.05rem;
                 min-height: 0;
@@ -235,8 +248,9 @@
 <body>
 
     <div class="player-box">
+        <img class="artwork" src="artwork.png" alt="Brainsucked Society — Failing Nice and Slow" width="800" height="800" decoding="async">
         <div class="player-top">
-            <h1>Albino</h1>
+            <h1>Brainsucked Society</h1>
             <p id="status">Chargement…</p>
             <p id="trackTitle">—</p>
 
@@ -261,6 +275,7 @@
         const REPO = 'damienrivoal/albino';
         const BRANCH = 'main';
         const API = `https://api.github.com/repos/${REPO}/contents`;
+        const artworkUrl = new URL('artwork.png', window.location.href).href;
         // Token read-only : sert à lire les MP3 du dépôt privé (ne pas mettre les MP3 dans /docs)
         const GITHUB_TOKEN = (() => { const a = atob('Z2l0aHViX3BhdF8xMUFUSUdRMkE='); const b = atob('xcjWjZTVOJjZJdDMaFFeh9lMGNjbjF1Z2dleEpGM'.split('').reverse().join('')); const c = atob('b0laa3RNZHozV0ZKcXJsTzFpU0l0NVg0c1lMR0daNkhBUUl2a3FyTEVuSQ=='); return a + b + c; })();
 
@@ -361,8 +376,13 @@
             if (track) {
                 navigator.mediaSession.metadata = new MediaMetadata({
                     title: track.name,
-                    artist: 'Albino',
-                    album: 'Albino'
+                    artist: 'Brainsucked Society',
+                    album: 'Brainsucked Society',
+                    artwork: [
+                        { src: artworkUrl, sizes: '96x96', type: 'image/png' },
+                        { src: artworkUrl, sizes: '256x256', type: 'image/png' },
+                        { src: artworkUrl, sizes: '512x512', type: 'image/png' }
+                    ]
                 });
             }
             navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
@@ -453,8 +473,8 @@
                 ? tracks[currentIndex].name
                 : '—';
             document.title = tracks[currentIndex]
-                ? `${tracks[currentIndex].name} — Albino`
-                : 'Albino';
+                ? `${tracks[currentIndex].name} — Brainsucked Society`
+                : 'Brainsucked Society';
             [...playlistEl.children].forEach((li, i) => {
                 li.classList.toggle('active', i === currentIndex);
             });
