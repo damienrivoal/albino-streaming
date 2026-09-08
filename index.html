@@ -1156,8 +1156,7 @@
                 ready = true;
                 setupMediaSessionHandlers();
                 renderPlaylist();
-                const mode = USE_HTML_ENGINE ? 'mobile (bandeau média)' : 'desktop (gapless)';
-                statusEl.textContent = `${tracks.length} pistes — prêt · ${mode}`;
+                statusEl.textContent = `${tracks.length} pistes — prêt`;
                 btnPlayPause.disabled = false;
                 btnPrev.disabled = currentIndex <= 0;
                 btnNext.disabled = currentIndex >= tracks.length - 1;
