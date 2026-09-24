@@ -227,6 +227,16 @@
             font-variant-numeric: tabular-nums;
         }
         #playlist li.active .num { color: var(--accent); }
+        .deploy-stamp {
+            display: block;
+            margin: 14px 0 0;
+            padding-top: 12px;
+            border-top: 1px solid #262626;
+            font-size: 11px;
+            line-height: 1.4;
+            color: var(--muted);
+            font-variant-numeric: tabular-nums;
+        }
 
         @media (max-width: 520px) {
             body {
@@ -273,6 +283,11 @@
                 padding: 14px;
                 border-bottom-color: #1f1f1f;
             }
+            .deploy-stamp {
+                margin: 10px 14px 0;
+                padding-top: 10px;
+                border-top-color: #1f1f1f;
+            }
         }
     </style>
 </head>
@@ -306,6 +321,7 @@
 
         <p class="playlist-label">Playlist</p>
         <ul id="playlist"></ul>
+        <time class="deploy-stamp" id="deployStamp" hidden></time>
     </div>
 
     <audio id="playerAudioA" preload="auto" playsinline></audio>
@@ -386,6 +402,7 @@
         const btnPlayPause = document.getElementById('btnPlayPause');
         const btnNext = document.getElementById('btnNext');
         const playlistEl = document.getElementById('playlist');
+        const deployStampEl = document.getElementById('deployStamp');
 
         function apiHeaders(json = true) {
             const headers = {
@@ -402,6 +419,67 @@
             const m = Math.floor(s / 60);
             const r = s % 60;
             return `${m}:${r.toString().padStart(2, '0')}`;
+        }
+
+        // Date/heure de la page servie (Last-Modified GitHub Pages) — change à chaque déploiement depuis main.
+        const DEPLOY_TZ = 'Europe/Paris';
+        const PAGES_REPO = 'damienrivoal/albino-streaming';
+
+        function isPlausibleDate(d) {
+            return d instanceof Date && Number.isFinite(d.getTime()) && d.getFullYear() > 2000;
+        }
+
+        function formatDeployStamp(date) {
+            const formatted = new Intl.DateTimeFormat('fr-FR', {
+                timeZone: DEPLOY_TZ,
+                day: 'numeric',
+                month: 'short',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            }).format(date);
+            return `Mis à jour : ${formatted} (${DEPLOY_TZ})`;
+        }
+
+        async function resolveDeployDate() {
+            const fromDoc = new Date(document.lastModified);
+            if (isPlausibleDate(fromDoc)) return fromDoc;
+
+            try {
+                const res = await fetch(location.href, { method: 'HEAD', cache: 'no-store' });
+                const lm = res.headers.get('Last-Modified');
+                if (lm) {
+                    const fromHead = new Date(lm);
+                    if (isPlausibleDate(fromHead)) return fromHead;
+                }
+            } catch (_) { /* ignore */ }
+
+            try {
+                const res = await fetch(
+                    `https://api.github.com/repos/${PAGES_REPO}/commits?path=index.html&per_page=1`,
+                    { headers: { Accept: 'application/vnd.github+json' } }
+                );
+                if (res.ok) {
+                    const [commit] = await res.json();
+                    const iso = commit?.commit?.committer?.date;
+                    if (iso) {
+                        const fromApi = new Date(iso);
+                        if (isPlausibleDate(fromApi)) return fromApi;
+                    }
+                }
+            } catch (_) { /* ignore */ }
+
+            return null;
+        }
+
+        async function showDeployStamp() {
+            if (!deployStampEl) return;
+            const date = await resolveDeployDate();
+            if (!date) return;
+            deployStampEl.textContent = formatDeployStamp(date);
+            deployStampEl.dateTime = date.toISOString();
+            deployStampEl.hidden = false;
+            deployStampEl.title = date.toISOString();
         }
 
         function currentOffset() {
@@ -1345,6 +1423,7 @@
         [btnPlayPause, btnPrev, btnNext].forEach(clearButtonFocus);
 
         (async function init() {
+            showDeployStamp();
             try {
                 await loadTrackList();
                 ready = true;
