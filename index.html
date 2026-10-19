@@ -334,13 +334,8 @@
         const artworkUrl = new URL('artwork.png', window.location.href).href;
         const GITHUB_TOKEN = (() => { const a = atob('Z2l0aHViX3BhdF8xMUFUSUdRMkE='); const b = atob('xcjWjZTVOJjZJdDMaFFeh9lMGNjbjF1Z2dleEpGM'.split('').reverse().join('')); const c = atob('b0laa3RNZHozV0ZKcXJsTzFpU0l0NVg0c1lMR0daNkhBUUl2a3FyTEVuSQ=='); return a + b + c; })();
 
-        // Mobile / tablette : <audio> (bandeau média). Desktop : Web Audio gapless réel.
-        const USE_HTML_ENGINE = (() => {
-            const ua = navigator.userAgent || '';
-            if (/Android|iPhone|iPad|iPod/i.test(ua)) return true;
-            if (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) return true;
-            return false;
-        })();
+        // HTML <audio> partout (stream download_url, bandeau média). Plus de Web Audio desktop.
+        const USE_HTML_ENGINE = true;
 
         // Mobile HTML : anticiper + léger overlap. Desktop Web Audio garde CROSSFADE_SEC.
         // Hors focus (Android Chrome) : déclencher plus tôt + crossfade plus court.
@@ -351,6 +346,7 @@
         const CROSSFADE_SEC = 0.05;
         const MAX_PAD_TRIM_SEC = 0.08;
         const LIST_REFRESH_MIN_MS = 30000;
+        const WARM_DEBOUNCE_MS = 100;
 
         let tracks = [];
         let githubToken = GITHUB_TOKEN;
@@ -364,13 +360,17 @@
         let seeking = false;
         let lastTrackListRefreshAt = 0;
         let trackListRefreshing = false;
+        let warmTimer = null;
+        let warmTarget = -1;
 
         // --- HTML engine state ---
         let handoffArmed = false;
         let handoffTimer = null;
         let syncing = false;
         let crossfadeRaf = null;
-        // Clé = sha du blob GitHub (identité contenu), pas l'index playlist.
+        // Préchargement HTML hors DOM (clé = sha).
+        const htmlWarmers = new Map();
+        // Blob URLs pour pistes dont le stream <audio> casse (ex. virgule dans le nom).
         const blobUrls = new Map();
         const inflightBlobs = new Map();
         const audioA = document.getElementById('playerAudioA');
@@ -390,8 +390,12 @@
         let fadingOutGain = null;
         let transitionTimer = null;
         let cleanupTimer = null;
+        // Clé = sha du blob GitHub (identité contenu).
+        const arrayBuffers = new Map();
+        const inflightBuffers = new Map();
         const decoded = new Map();
         const inflightDecoded = new Map();
+        const trimmedShas = new Set();
 
         const statusEl = document.getElementById('status');
         const trackTitleEl = document.getElementById('trackTitle');
@@ -628,8 +632,11 @@
             playlistEl.innerHTML = '';
             tracks.forEach((track, i) => {
                 const li = document.createElement('li');
+                li.tabIndex = 0;
                 li.innerHTML = `<span class="num">${String(i + 1).padStart(2, '0')}</span><span>${track.name}</span>`;
                 li.addEventListener('click', () => playTrack(i, 0));
+                li.addEventListener('pointerenter', () => scheduleWarm(i));
+                li.addEventListener('focus', () => scheduleWarm(i));
                 playlistEl.appendChild(li);
             });
         }
@@ -650,33 +657,64 @@
                 .map(f => ({
                     name: f.name.replace(/\.mp3$/i, ''),
                     path: f.path,
-                    sha: f.sha
+                    sha: f.sha,
+                    download_url: f.download_url
                 }));
             if (!tracks.length) throw new Error('Aucun MP3 trouvé dans le dépôt privé.');
+            if (tracks.some(t => !t.download_url)) {
+                throw new Error('download_url manquant pour au moins une piste (API Contents).');
+            }
             lastTrackListRefreshAt = Date.now();
         }
 
+        function pruneArrayBuffers(around) {
+            const keep = new Set();
+            for (let i = around - 1; i <= around + 2; i++) {
+                const sha = trackShaAt(i);
+                if (sha) keep.add(sha);
+            }
+            for (const key of [...arrayBuffers.keys()]) {
+                if (!keep.has(key)) arrayBuffers.delete(key);
+            }
+        }
+
         async function fetchTrackArrayBuffer(track) {
-            const blobRes = await fetch(`https://api.github.com/repos/${REPO}/git/blobs/${track.sha}`, {
-                headers: {
-                    Authorization: `Bearer ${githubToken}`,
-                    Accept: 'application/vnd.github.raw',
-                    'X-GitHub-Api-Version': '2022-11-28'
-                },
-                cache: 'no-store'
-            });
-            if (!blobRes.ok) throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
-            return blobRes.arrayBuffer();
+            const sha = track.sha;
+            if (arrayBuffers.has(sha)) return arrayBuffers.get(sha);
+            if (inflightBuffers.has(sha)) return inflightBuffers.get(sha);
+            const promise = (async () => {
+                const blobRes = await fetch(`https://api.github.com/repos/${REPO}/git/blobs/${sha}`, {
+                    headers: {
+                        Authorization: `Bearer ${githubToken}`,
+                        Accept: 'application/vnd.github.raw',
+                        'X-GitHub-Api-Version': '2022-11-28'
+                    },
+                    cache: 'force-cache'
+                });
+                if (!blobRes.ok) throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
+                const buf = await blobRes.arrayBuffer();
+                arrayBuffers.set(sha, buf);
+                inflightBuffers.delete(sha);
+                const around = tracks.findIndex(t => t.sha === sha);
+                pruneArrayBuffers(around >= 0 ? around : currentIndex);
+                return buf;
+            })().catch(err => { inflightBuffers.delete(sha); throw err; });
+            inflightBuffers.set(sha, promise);
+            return promise;
         }
 
         function invalidateAudioCaches() {
+            htmlWarmers.clear();
             for (const url of blobUrls.values()) {
                 try { URL.revokeObjectURL(url); } catch (_) {}
             }
             blobUrls.clear();
             inflightBlobs.clear();
+            arrayBuffers.clear();
+            inflightBuffers.clear();
             decoded.clear();
             inflightDecoded.clear();
+            trimmedShas.clear();
             if (USE_HTML_ENGINE) {
                 syncing = true;
                 try {
@@ -691,6 +729,9 @@
 
         function pruneCachesToPlaylist() {
             const valid = new Set(tracks.map(t => t.sha));
+            for (const key of [...htmlWarmers.keys()]) {
+                if (!valid.has(key)) htmlWarmers.delete(key);
+            }
             for (const key of [...blobUrls.keys()]) {
                 if (!valid.has(key)) {
                     try { URL.revokeObjectURL(blobUrls.get(key)); } catch (_) {}
@@ -700,12 +741,54 @@
             for (const key of [...inflightBlobs.keys()]) {
                 if (!valid.has(key)) inflightBlobs.delete(key);
             }
+            for (const key of [...arrayBuffers.keys()]) {
+                if (!valid.has(key)) arrayBuffers.delete(key);
+            }
+            for (const key of [...inflightBuffers.keys()]) {
+                if (!valid.has(key)) inflightBuffers.delete(key);
+            }
             for (const key of [...decoded.keys()]) {
                 if (!valid.has(key)) decoded.delete(key);
             }
             for (const key of [...inflightDecoded.keys()]) {
                 if (!valid.has(key)) inflightDecoded.delete(key);
             }
+            for (const key of [...trimmedShas]) {
+                if (!valid.has(key)) trimmedShas.delete(key);
+            }
+        }
+
+        function scheduleWarm(index) {
+            warmTarget = index;
+            if (warmTimer != null) clearTimeout(warmTimer);
+            warmTimer = setTimeout(() => {
+                warmTimer = null;
+                warmTrack(warmTarget);
+            }, WARM_DEBOUNCE_MS);
+        }
+
+        function scheduleIdleWarm(around = currentIndex) {
+            const run = () => {
+                for (const i of [around, around + 1, around + 2, around - 1]) {
+                    if (i >= 0 && i < tracks.length) warmTrack(i);
+                }
+            };
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(run, { timeout: 2000 });
+            } else {
+                setTimeout(run, 200);
+            }
+        }
+
+        function warmTrack(index) {
+            if (index < 0 || index >= tracks.length) return;
+            if (USE_HTML_ENGINE) {
+                warmHtmlStream(index);
+                return;
+            }
+            fetchTrackArrayBuffer(tracks[index]).then(() => {
+                if (audioCtx) getDecoded(index);
+            }).catch(e => console.warn('warmTrack', e));
         }
 
         async function refreshTrackList({ force = false } = {}) {
@@ -729,7 +812,11 @@
                         t.path === tracks[i].path &&
                         t.name === tracks[i].name
                     );
-                if (unchanged) return;
+                if (unchanged) {
+                    // Nouveaux tokens download_url éventuels : invalider les préchargements HTML.
+                    htmlWarmers.clear();
+                    return;
+                }
 
                 let newIndex = tracks.findIndex(t => t.sha === prevSha);
                 if (newIndex < 0) newIndex = Math.min(prevIndex, tracks.length - 1);
@@ -747,9 +834,11 @@
                     statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
                     updateTransportUi();
                     if (USE_HTML_ENGINE) preloadStandby(currentIndex + 1);
+                    scheduleIdleWarm(currentIndex);
                 } else {
                     statusEl.textContent = `${tracks.length} pistes — liste actualisée`;
                     updateTransportUi();
+                    scheduleIdleWarm(currentIndex);
                 }
             } catch (e) {
                 console.warn('refreshTrackList', e);
@@ -760,35 +849,84 @@
 
         // ===================== HTML engine (mobile) =====================
 
-        function pruneBlobUrls(around) {
+        function streamUrlAt(index) {
+            const url = tracks[index]?.download_url;
+            if (!url) throw new Error('Index hors limites ou download_url manquant');
+            return url;
+        }
+
+        // <audio src> vers raw.githubusercontent casse souvent si le chemin contient une virgule.
+        function needsBlobFallback(track) {
+            const label = `${track?.name || ''}\0${track?.path || ''}`;
+            return label.includes(',');
+        }
+
+        function audioSrcMatches(el, url) {
+            if (!el.src) return false;
+            try {
+                return el.src === url || el.src === new URL(url, location.href).href;
+            } catch (_) {
+                return el.getAttribute('src') === url;
+            }
+        }
+
+        function pruneHtmlWarmers(around) {
             const keep = new Set();
             for (let i = around - 1; i <= around + 2; i++) {
                 const sha = trackShaAt(i);
                 if (sha) keep.add(sha);
             }
+            for (const key of [...htmlWarmers.keys()]) {
+                if (!keep.has(key)) htmlWarmers.delete(key);
+            }
             for (const key of [...blobUrls.keys()]) {
                 if (!keep.has(key)) {
-                    URL.revokeObjectURL(blobUrls.get(key));
+                    try { URL.revokeObjectURL(blobUrls.get(key)); } catch (_) {}
                     blobUrls.delete(key);
                 }
             }
         }
 
-        function getBlobUrl(index) {
+        function getBlobPlayUrl(index) {
             if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
-            const sha = tracks[index].sha;
+            const track = tracks[index];
+            const sha = track.sha;
             if (blobUrls.has(sha)) return Promise.resolve(blobUrls.get(sha));
             if (inflightBlobs.has(sha)) return inflightBlobs.get(sha);
             const promise = (async () => {
-                const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
-                const url = URL.createObjectURL(new Blob([arrayBuffer], { type: 'audio/mpeg' }));
+                // API blobs authentifiée (pas download_url : CORS bloque fetch() cross-origin).
+                const buf = await fetchTrackArrayBuffer(track);
+                const url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
                 blobUrls.set(sha, url);
                 inflightBlobs.delete(sha);
-                pruneBlobUrls(index);
+                pruneHtmlWarmers(index);
                 return url;
             })().catch(err => { inflightBlobs.delete(sha); throw err; });
             inflightBlobs.set(sha, promise);
             return promise;
+        }
+
+        async function resolveHtmlPlayUrl(index) {
+            const track = tracks[index];
+            if (!track) throw new Error('Index hors limites');
+            if (needsBlobFallback(track)) return getBlobPlayUrl(index);
+            return streamUrlAt(index);
+        }
+
+        function warmHtmlStream(index) {
+            const track = tracks[index];
+            if (!track) return;
+            if (needsBlobFallback(track)) {
+                getBlobPlayUrl(index).catch(e => console.warn('warm blob', e));
+                return;
+            }
+            if (!track.download_url) return;
+            if (htmlWarmers.has(track.sha)) return;
+            const a = new Audio();
+            a.preload = 'auto';
+            a.src = track.download_url;
+            htmlWarmers.set(track.sha, a);
+            pruneHtmlWarmers(index);
         }
 
         function waitMetadata(el) {
@@ -806,12 +944,22 @@
         }
 
         async function prepareElement(el, index) {
-            const url = await getBlobUrl(index);
-            if (el.src !== url) {
-                el.src = url;
-                el.load();
+            try {
+                const url = await resolveHtmlPlayUrl(index);
+                if (!audioSrcMatches(el, url)) {
+                    el.src = url;
+                    el.load();
+                }
+                await waitMetadata(el);
+            } catch (e) {
+                // Dernier recours : Blob même sans virgule détectée.
+                const url = await getBlobPlayUrl(index);
+                if (!audioSrcMatches(el, url)) {
+                    el.src = url;
+                    el.load();
+                }
+                await waitMetadata(el);
             }
-            await waitMetadata(el);
         }
 
         async function preloadStandby(nextIndex) {
@@ -919,7 +1067,7 @@
             (async () => {
                 if (gen !== playGeneration) return;
                 try {
-                    if (!standby.src) await prepareElement(standby, nextIndex);
+                    await prepareElement(standby, nextIndex);
                     if (gen !== playGeneration) return;
 
                     standby.currentTime = 0;
@@ -956,6 +1104,7 @@
                     updateTransportUi();
                     preloadStandby(currentIndex + 1);
                     scheduleHandoffFromActive();
+                    scheduleIdleWarm(currentIndex);
                 } catch (e) {
                     console.error(e);
                     cancelHtmlCrossfade();
@@ -978,8 +1127,8 @@
             updateTransportUi();
 
             try {
-                if (index + 1 < tracks.length) getBlobUrl(index + 1);
-                if (index - 1 >= 0) getBlobUrl(index - 1);
+                warmTrack(index + 1);
+                warmTrack(index - 1);
 
                 syncing = true;
                 standby.pause();
@@ -1000,6 +1149,7 @@
                 startProgressLoop();
                 preloadStandby(index + 1);
                 scheduleHandoffFromActive();
+                scheduleIdleWarm(index);
             } catch (e) {
                 console.error(e);
                 syncing = false;
@@ -1039,7 +1189,10 @@
                 if (sha) keep.add(sha);
             }
             for (const key of [...decoded.keys()]) {
-                if (!keep.has(key)) decoded.delete(key);
+                if (!keep.has(key)) {
+                    decoded.delete(key);
+                    trimmedShas.delete(key);
+                }
             }
         }
 
@@ -1070,6 +1223,16 @@
             return trimmed;
         }
 
+        function ensureTrimmed(sha) {
+            const buf = decoded.get(sha);
+            if (!buf) return null;
+            if (trimmedShas.has(sha)) return buf;
+            const trimmed = trimMp3Padding(buf);
+            decoded.set(sha, trimmed);
+            trimmedShas.add(sha);
+            return trimmed;
+        }
+
         function getDecoded(index) {
             if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
             const sha = tracks[index].sha;
@@ -1077,11 +1240,12 @@
             if (inflightDecoded.has(sha)) return inflightDecoded.get(sha);
             const promise = (async () => {
                 const arrayBuffer = await fetchTrackArrayBuffer(tracks[index]);
+                if (!audioCtx) await ensureAudioCtx();
                 const raw = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-                const audioBuffer = trimMp3Padding(raw);
-                decoded.set(sha, audioBuffer);
+                // Trim différé : appliqué juste avant scheduleFollowing (gapless).
+                decoded.set(sha, raw);
                 inflightDecoded.delete(sha);
-                return audioBuffer;
+                return raw;
             })().catch(err => { inflightDecoded.delete(sha); throw err; });
             inflightDecoded.set(sha, promise);
             return promise;
@@ -1135,8 +1299,11 @@
                 return;
             }
 
-            getDecoded(index + 1).then(nextBuf => {
+            getDecoded(index + 1).then(() => {
                 if (gen !== playGeneration) return;
+                const nextSha = trackShaAt(index + 1);
+                const nextBuf = ensureTrimmed(nextSha);
+                if (!nextBuf) throw new Error('Buffer suivant indisponible');
                 const nextGain = audioCtx.createGain();
                 nextGain.gain.setValueAtTime(0, fadeStart);
                 nextGain.gain.linearRampToValueAtTime(1, endTime);
@@ -1168,6 +1335,7 @@
                     if (currentIndex + 2 < tracks.length) getDecoded(currentIndex + 2);
                     statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
                     updateTransportUi();
+                    scheduleIdleWarm(currentIndex);
                     cleanupTimer = setTimeout(() => {
                         killSourceGain(fadingOutSource, fadingOutGain);
                         fadingOutSource = fadingOutGain = null;
@@ -1218,6 +1386,7 @@
                 startProgressLoop();
                 scheduleFollowing(gen, index, when, buffer.duration - offset, gain);
                 pruneDecoded(index);
+                scheduleIdleWarm(index);
             } catch (e) {
                 console.error(e);
                 if (gen !== playGeneration) return;
@@ -1435,6 +1604,7 @@
                 btnNext.disabled = currentIndex >= tracks.length - 1;
                 trackTitleEl.textContent = tracks[0].name;
                 updateTransportUi();
+                scheduleIdleWarm(0);
             } catch (e) {
                 console.error(e);
                 statusEl.textContent = e.message || String(e);
