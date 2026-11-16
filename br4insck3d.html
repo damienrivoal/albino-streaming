@@ -346,12 +346,15 @@
 
         // --- HTML engine state ---
         let handoffArmed = false;
+        let handoffDeferred = false;
         let syncing = false;
         let crossfadeRaf = null;
+        let activeStalled = false;
         const htmlWarmers = new Map();
         // Blob URLs pour pistes dont le stream <audio> casse (ex. virgule dans le nom).
         const blobUrls = new Map();
         const inflightBlobs = new Map();
+        const failedShas = new Set();
         const audioA = document.getElementById('playerAudioA');
         const audioB = document.getElementById('playerAudioB');
         let active = audioA;
@@ -586,10 +589,14 @@
             }
         }
 
-        async function fetchTrackArrayBuffer(track) {
+        async function fetchTrackArrayBuffer(track, { bypassCache = false } = {}) {
             const sha = track.sha;
-            if (arrayBuffers.has(sha)) return arrayBuffers.get(sha);
-            if (inflightBuffers.has(sha)) return inflightBuffers.get(sha);
+            if (!bypassCache && arrayBuffers.has(sha)) return arrayBuffers.get(sha);
+            if (!bypassCache && inflightBuffers.has(sha)) return inflightBuffers.get(sha);
+            if (bypassCache) {
+                arrayBuffers.delete(sha);
+                inflightBuffers.delete(sha);
+            }
             const promise = (async () => {
                 const blobRes = await fetch(`https://api.github.com/repos/${REPO}/git/blobs/${sha}`, {
                     headers: {
@@ -597,7 +604,7 @@
                         Accept: 'application/vnd.github.raw',
                         'X-GitHub-Api-Version': '2022-11-28'
                     },
-                    cache: 'force-cache'
+                    cache: bypassCache ? 'no-store' : 'force-cache'
                 });
                 if (!blobRes.ok) throw new Error(`Téléchargement ${track.path} : HTTP ${blobRes.status}`);
                 const buf = await blobRes.arrayBuffer();
@@ -611,8 +618,43 @@
             return promise;
         }
 
+        function hardInvalidateTrack(sha) {
+            if (!sha) return;
+            if (blobUrls.has(sha)) {
+                try { URL.revokeObjectURL(blobUrls.get(sha)); } catch (_) {}
+                blobUrls.delete(sha);
+            }
+            inflightBlobs.delete(sha);
+            arrayBuffers.delete(sha);
+            inflightBuffers.delete(sha);
+            htmlWarmers.delete(sha);
+        }
+
+        function resetHtmlElements() {
+            syncing = true;
+            try {
+                audioA.removeAttribute('src');
+                audioA.load();
+                audioB.removeAttribute('src');
+                audioB.load();
+            } catch (_) {}
+            syncing = false;
+        }
+
+        function clearHtmlWarmers({ keepNext = false } = {}) {
+            const keep = keepNext ? trackShaAt(currentIndex + 1) : null;
+            for (const [sha, el] of [...htmlWarmers.entries()]) {
+                if (keep && sha === keep) continue;
+                try {
+                    el.removeAttribute('src');
+                    el.load();
+                } catch (_) {}
+                htmlWarmers.delete(sha);
+            }
+        }
+
         function invalidateAudioCaches() {
-            htmlWarmers.clear();
+            clearHtmlWarmers();
             for (const url of blobUrls.values()) {
                 try { URL.revokeObjectURL(url); } catch (_) {}
             }
@@ -623,16 +665,8 @@
             decoded.clear();
             inflightDecoded.clear();
             trimmedShas.clear();
-            if (USE_HTML_ENGINE) {
-                syncing = true;
-                try {
-                    audioA.removeAttribute('src');
-                    audioA.load();
-                    audioB.removeAttribute('src');
-                    audioB.load();
-                } catch (_) {}
-                syncing = false;
-            }
+            failedShas.clear();
+            if (USE_HTML_ENGINE) resetHtmlElements();
         }
 
         function pruneCachesToPlaylist() {
@@ -664,9 +698,13 @@
             for (const key of [...trimmedShas]) {
                 if (!valid.has(key)) trimmedShas.delete(key);
             }
+            for (const key of [...failedShas]) {
+                if (!valid.has(key)) failedShas.delete(key);
+            }
         }
 
         function scheduleWarm(index) {
+            if (USE_HTML_ENGINE && isPlaying && index !== currentIndex + 1) return;
             warmTarget = index;
             if (warmTimer != null) clearTimeout(warmTimer);
             warmTimer = setTimeout(() => {
@@ -676,7 +714,18 @@
         }
 
         function scheduleIdleWarm(around = currentIndex) {
+            if (activeStalled) return;
             const run = () => {
+                if (activeStalled) return;
+                if (USE_HTML_ENGINE) {
+                    if (isPlaying) {
+                        warmTrack(around + 1);
+                    } else {
+                        warmTrack(around);
+                        warmTrack(around + 1);
+                    }
+                    return;
+                }
                 for (const i of [around, around + 1, around + 2, around - 1]) {
                     if (i >= 0 && i < tracks.length) warmTrack(i);
                 }
@@ -691,6 +740,8 @@
         function warmTrack(index) {
             if (index < 0 || index >= tracks.length) return;
             if (USE_HTML_ENGINE) {
+                if (isPlaying && index !== currentIndex + 1) return;
+                if (activeStalled) return;
                 warmHtmlStream(index);
                 return;
             }
@@ -779,9 +830,14 @@
 
         function pruneHtmlWarmers(around) {
             const keep = new Set();
-            for (let i = around - 1; i <= around + 2; i++) {
-                const sha = trackShaAt(i);
-                if (sha) keep.add(sha);
+            if (isPlaying) {
+                const next = trackShaAt(around + 1);
+                if (next) keep.add(next);
+            } else {
+                for (let i = around; i <= around + 1; i++) {
+                    const sha = trackShaAt(i);
+                    if (sha) keep.add(sha);
+                }
             }
             for (const key of [...htmlWarmers.keys()]) {
                 if (!keep.has(key)) htmlWarmers.delete(key);
@@ -794,15 +850,15 @@
             }
         }
 
-        function getBlobPlayUrl(index) {
+        function getBlobPlayUrl(index, { force = false } = {}) {
             if (index < 0 || index >= tracks.length) return Promise.reject(new Error('Index hors limites'));
             const track = tracks[index];
             const sha = track.sha;
-            if (blobUrls.has(sha)) return Promise.resolve(blobUrls.get(sha));
-            if (inflightBlobs.has(sha)) return inflightBlobs.get(sha);
+            if (force) hardInvalidateTrack(sha);
+            if (!force && blobUrls.has(sha)) return Promise.resolve(blobUrls.get(sha));
+            if (!force && inflightBlobs.has(sha)) return inflightBlobs.get(sha);
             const promise = (async () => {
-                // API blobs authentifiée (pas download_url : CORS bloque fetch() cross-origin).
-                const buf = await fetchTrackArrayBuffer(track);
+                const buf = await fetchTrackArrayBuffer(track, { bypassCache: force });
                 const url = URL.createObjectURL(new Blob([buf], { type: 'audio/mpeg' }));
                 blobUrls.set(sha, url);
                 inflightBlobs.delete(sha);
@@ -813,17 +869,21 @@
             return promise;
         }
 
-        async function resolveHtmlPlayUrl(index) {
+        async function resolveHtmlPlayUrl(index, { forceBlob = false } = {}) {
             const track = tracks[index];
             if (!track) throw new Error('Index hors limites');
-            if (needsBlobFallback(track)) return getBlobPlayUrl(index);
+            if (forceBlob || failedShas.has(track.sha) || needsBlobFallback(track)) {
+                return getBlobPlayUrl(index, { force: forceBlob || failedShas.has(track.sha) });
+            }
             return streamUrlAt(index);
         }
 
         function warmHtmlStream(index) {
             const track = tracks[index];
             if (!track) return;
-            if (needsBlobFallback(track)) {
+            if (isPlaying && index !== currentIndex + 1) return;
+            if (needsBlobFallback(track) || failedShas.has(track.sha)) {
+                if (isPlaying) return;
                 getBlobPlayUrl(index).catch(e => console.warn('warm blob', e));
                 return;
             }
@@ -850,21 +910,43 @@
             });
         }
 
-        async function prepareElement(el, index) {
+        async function prepareElement(el, index, { forceRecover = false } = {}) {
+            const track = tracks[index];
+            const sha = track?.sha;
+            const recover = forceRecover || (sha && failedShas.has(sha));
+            if (recover && sha) {
+                hardInvalidateTrack(sha);
+                syncing = true;
+                try {
+                    el.removeAttribute('src');
+                    el.load();
+                } catch (_) {}
+                syncing = false;
+            }
             try {
-                const url = await resolveHtmlPlayUrl(index);
+                const url = await resolveHtmlPlayUrl(index, { forceBlob: recover });
                 if (!audioSrcMatches(el, url)) {
                     el.src = url;
                     el.load();
                 }
                 await waitMetadata(el);
+                if (sha) failedShas.delete(sha);
             } catch (e) {
-                const url = await getBlobPlayUrl(index);
-                if (!audioSrcMatches(el, url)) {
-                    el.src = url;
-                    el.load();
+                if (sha) {
+                    failedShas.add(sha);
+                    hardInvalidateTrack(sha);
                 }
+                const url = await getBlobPlayUrl(index, { force: true });
+                syncing = true;
+                try {
+                    el.removeAttribute('src');
+                    el.load();
+                } catch (_) {}
+                syncing = false;
+                el.src = url;
+                el.load();
                 await waitMetadata(el);
+                if (sha) failedShas.delete(sha);
             }
         }
 
@@ -927,7 +1009,7 @@
         }
 
         function maybeHandoff() {
-            if (!isPlaying || handoffArmed || seeking) return;
+            if (!isPlaying || handoffArmed || handoffDeferred || seeking || activeStalled) return;
             const dur = active.duration;
             if (!Number.isFinite(dur) || dur <= 0) return;
             if (dur - active.currentTime > HANDOFF_SEC) return;
@@ -942,6 +1024,12 @@
                 try {
                     await prepareElement(standby, nextIndex);
                     if (gen !== playGeneration) return;
+
+                    if (standby.readyState < 2) {
+                        handoffArmed = false;
+                        handoffDeferred = true;
+                        return;
+                    }
 
                     standby.currentTime = 0;
                     setHtmlVolume(active, 1);
@@ -971,6 +1059,9 @@
                     currentIndex = nextIndex;
                     pauseOffset = 0;
                     handoffArmed = false;
+                    handoffDeferred = false;
+                    activeStalled = false;
+                    clearHtmlWarmers({ keepNext: true });
                     statusEl.textContent = `Piste ${currentIndex + 1} / ${tracks.length}`;
                     updateTransportUi();
                     preloadStandby(currentIndex + 1);
@@ -980,6 +1071,9 @@
                     cancelHtmlCrossfade();
                     resetHtmlVolumes();
                     handoffArmed = false;
+                    handoffDeferred = true;
+                    const nextSha = trackShaAt(nextIndex);
+                    if (nextSha) failedShas.add(nextSha);
                 }
             })();
         }
@@ -989,18 +1083,21 @@
             cancelHtmlCrossfade();
             resetHtmlVolumes();
             handoffArmed = false;
+            handoffDeferred = false;
+            activeStalled = false;
             currentIndex = index;
             isPlaying = false;
             statusEl.textContent = `Chargement : ${tracks[index].name}…`;
             updateTransportUi();
 
-            try {
-                warmTrack(index + 1);
-                warmTrack(index - 1);
+            const sha = tracks[index]?.sha;
+            const recover = !!(sha && failedShas.has(sha));
+            clearHtmlWarmers({ keepNext: false });
 
+            try {
                 syncing = true;
                 standby.pause();
-                await prepareElement(active, index);
+                await prepareElement(active, index, { forceRecover: recover });
                 if (gen !== playGeneration) return;
 
                 offset = Math.max(0, Math.min(offset, Math.max(0, active.duration - 0.05)));
@@ -1012,6 +1109,7 @@
                 if (gen !== playGeneration) return;
 
                 isPlaying = true;
+                activeStalled = false;
                 statusEl.textContent = `Piste ${index + 1} / ${tracks.length}`;
                 updateTransportUi();
                 startProgressLoop();
@@ -1020,6 +1118,7 @@
             } catch (e) {
                 console.error(e);
                 syncing = false;
+                if (sha) failedShas.add(sha);
                 if (gen !== playGeneration) return;
                 isPlaying = false;
                 statusEl.textContent = e.message || String(e);
@@ -1371,6 +1470,8 @@
 
         function onActiveEnded() {
             if (syncing || handoffArmed) return;
+            handoffDeferred = false;
+            activeStalled = false;
             if (currentIndex + 1 < tracks.length) {
                 playTrack(currentIndex + 1, 0);
                 return;
@@ -1382,9 +1483,61 @@
             stopProgressLoop();
         }
 
+        function onActiveBufferPressure(el) {
+            if (el !== active || !isPlaying || syncing) return;
+            activeStalled = true;
+            clearHtmlWarmers();
+        }
+
+        function onActivePlayingAgain(el) {
+            if (el !== active) return;
+            if (activeStalled) {
+                activeStalled = false;
+                if (isPlaying) scheduleIdleWarm(currentIndex);
+            }
+        }
+
+        function onHtmlMediaError(el) {
+            if (syncing) return;
+            if (el === active) {
+                const sha = trackShaAt(currentIndex);
+                if (sha) {
+                    failedShas.add(sha);
+                    hardInvalidateTrack(sha);
+                }
+                activeStalled = true;
+                clearHtmlWarmers();
+                if (isPlaying) {
+                    isPlaying = false;
+                    pauseOffset = currentOffset();
+                    statusEl.textContent = 'Buffer interrompu — retentez la piste';
+                    updateTransportUi();
+                    stopProgressLoop();
+                }
+                return;
+            }
+            if (el === standby) {
+                const sha = trackShaAt(currentIndex + 1);
+                if (sha) {
+                    failedShas.add(sha);
+                    hardInvalidateTrack(sha);
+                }
+            }
+        }
+
         if (USE_HTML_ENGINE) {
             audioA.addEventListener('ended', () => { if (active === audioA) onActiveEnded(); });
             audioB.addEventListener('ended', () => { if (active === audioB) onActiveEnded(); });
+            audioA.addEventListener('waiting', () => onActiveBufferPressure(audioA));
+            audioB.addEventListener('waiting', () => onActiveBufferPressure(audioB));
+            audioA.addEventListener('stalled', () => onActiveBufferPressure(audioA));
+            audioB.addEventListener('stalled', () => onActiveBufferPressure(audioB));
+            audioA.addEventListener('playing', () => onActivePlayingAgain(audioA));
+            audioB.addEventListener('playing', () => onActivePlayingAgain(audioB));
+            audioA.addEventListener('canplay', () => onActivePlayingAgain(audioA));
+            audioB.addEventListener('canplay', () => onActivePlayingAgain(audioB));
+            audioA.addEventListener('error', () => onHtmlMediaError(audioA));
+            audioB.addEventListener('error', () => onHtmlMediaError(audioB));
             audioA.addEventListener('pause', () => {
                 if (!syncing && active === audioA && isPlaying) pause();
             });
